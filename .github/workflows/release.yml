@@ -31,6 +31,11 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
+            env:
+              # Set jemalloc page size to 16K (2^14) for ARM64 Linux targets.
+              # This ensures compatibility with systems using 16K pages like Raspberry Pi OS on RPi 5.
+              # Without this configuration, the binary may fail with "<jemalloc>: Unsupported system page size".
+              JEMALLOC_SYS_WITH_LG_PAGE: 14
     runs-on: ${{ matrix.os }}
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -54,3 +59,5 @@ jobs:
           archive: "corrosion-$target"
           target: ${{ matrix.target }}
           token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          JEMALLOC_SYS_WITH_LG_PAGE: ${{ matrix.env.JEMALLOC_SYS_WITH_LG_PAGE || '' }}
