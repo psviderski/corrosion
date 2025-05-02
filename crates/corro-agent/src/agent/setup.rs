@@ -3,6 +3,8 @@
 // External crates
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
+use indexmap::IndexMap;
+use metrics::counter;
 use parking_lot::RwLock;
 use rusqlite::{Connection, OptionalExtension};
 use std::{
@@ -18,17 +20,21 @@ use tokio::{
         RwLock as TokioRwLock, Semaphore,
     },
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace, warn};
 use tripwire::Tripwire;
 
 // Internals
 use crate::{
     api::{
         peer::gossip_server_endpoint,
-        public::pubsub::{process_sub_channel, MatcherBroadcastCache, SharedMatcherBroadcastCache},
+        public::{
+            pubsub::{process_sub_channel, MatcherBroadcastCache, SharedMatcherBroadcastCache},
+            update::SharedUpdateBroadcastCache,
+        },
     },
     transport::Transport,
 };
+use corro_types::updates::UpdatesManager;
 use corro_types::{
     actor::ActorId,
     agent::{migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, SplitPool},
@@ -57,6 +63,7 @@ pub struct AgentOptions {
     pub rtt_rx: TokioReceiver<(SocketAddr, Duration)>,
     pub subs_manager: SubsManager,
     pub subs_bcast_cache: SharedMatcherBroadcastCache,
+    pub updates_bcast_cache: SharedUpdateBroadcastCache,
     pub tripwire: Tripwire,
 }
 
@@ -106,6 +113,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let subs_manager = SubsManager::default();
 
+    let updates_manager = UpdatesManager::default();
     // Setup subscription handlers
     let subs_bcast_cache = setup_spawn_subscriptions(
         &subs_manager,
@@ -115,6 +123,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         &tripwire,
     )
     .await?;
+
+    let updates_bcast_cache = SharedUpdateBroadcastCache::default();
 
     let cluster_id = {
         let conn = pool.read().await?;
@@ -163,13 +173,59 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     tokio::spawn({
         let pool = pool.clone();
         // acquiring the lock here means everything will have to wait for it to be ready
-        let mut booked = booked.write_owned("init").await;
+        let mut booked = booked.write_owned::<&str, _>("init", None).await;
         async move {
             let conn = pool.read().await?;
             *booked.deref_mut().deref_mut() =
                 tokio::task::block_in_place(|| BookedVersions::from_conn(&conn, actor_id))
                     .expect("loading BookedVersions from db failed");
             Ok::<_, eyre::Report>(())
+        }
+    });
+
+    tokio::spawn({
+        let registry = lock_registry.clone();
+        async move {
+            const WARNING_THRESHOLD: Duration = Duration::from_secs(10);
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+
+            loop {
+                interval.tick().await;
+                trace!("inspecting the lock registry...");
+
+                let top: IndexMap<_, _> = {
+                    registry
+                        .map
+                        .read()
+                        .iter()
+                        .take(10) // this is an ordered map, so taking the first few is gonna be the highest values
+                        .map(|(k, v)| (*k, v.clone()))
+                        .collect()
+                };
+
+                if top
+                    .values()
+                    .any(|meta| meta.started_at.elapsed() >= WARNING_THRESHOLD)
+                {
+                    warn!(
+                        "lock registry shows locks held for a long time! top {} locks:",
+                        top.len()
+                    );
+
+                    for (id, lock) in top {
+                        let duration = lock.started_at.elapsed();
+                        warn!(
+                            "{} (id: {id}, type: {:?}, state: {:?}) locked for: {duration:?}",
+                            lock.label, lock.kind, lock.state
+                        );
+
+                        if duration >= WARNING_THRESHOLD {
+                            counter!("corro.agent.lock.slow.count", "name" => lock.label)
+                                .increment(1);
+                        }
+                    }
+                }
+            }
         }
     });
 
@@ -187,6 +243,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         rtt_rx,
         subs_manager: subs_manager.clone(),
         subs_bcast_cache,
+        updates_bcast_cache,
         tripwire: tripwire.clone(),
     };
 
@@ -210,6 +267,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         schema: RwLock::new(schema),
         cluster_id,
         subs_manager,
+        updates_manager,
         tripwire,
     });
 

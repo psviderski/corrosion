@@ -229,7 +229,7 @@ async fn update_hashes(
 
         let services = conn
             .prepare(
-                "SELECT id, name, tags, meta, port, address FROM consul_services WHERE node = ?",
+                "SELECT id, name, tags, meta, port, address FROM consul_services WHERE node = ? AND source IS NULL",
             )?
             .query_map([nodename], |row| {
                 let tag_json: String = row.get(2)?;
@@ -258,7 +258,7 @@ async fn update_hashes(
             .map_err(|e| eyre::eyre!("could not query consul_checks' table_info: {e}"))?
             .collect::<Result<Vec<_>, _>>()?;
 
-        let checks = conn.prepare("SELECT id, name, status, output, service_id, service_name FROM consul_checks WHERE node = ?")?
+        let checks = conn.prepare("SELECT id, name, status, output, service_id, service_name FROM consul_checks WHERE node = ? AND source IS NULL")?
             .query_map([nodename], |row| {
                 Ok(AgentCheck{
                     id: row.get(0)?,
@@ -305,7 +305,7 @@ async fn update_hashes(
 
     if !statements.is_empty() {
         if let Some(e) = corrosion
-            .execute(&statements)
+            .execute(&statements, None)
             .await?
             .results
             .into_iter()
@@ -412,7 +412,8 @@ fn append_upsert_service_statements(
         meta = excluded.meta,
         port = excluded.port,
         address = excluded.address,
-        updated_at = excluded.updated_at;"
+        updated_at = excluded.updated_at
+    WHERE source IS NULL;"
             .into(),
         vec![
             node.into(),
@@ -457,7 +458,8 @@ fn append_upsert_check_statements(
         name = excluded.name,
         status = excluded.status,
         output = excluded.output,
-        updated_at = excluded.updated_at;"
+        updated_at = excluded.updated_at
+    WHERE source IS NULL;"
                                           .into(),vec![
                                               node.into(),
                                               check.id.into(),
@@ -651,7 +653,8 @@ async fn execute(
                     vec![id.clone().into()],
                 ));
                 statements.push(Statement::WithParams(
-                    "DELETE FROM consul_services WHERE node = ? AND id = ?;".into(),
+                    "DELETE FROM consul_services WHERE node = ? AND id = ? AND source IS NULL;"
+                        .into(),
                     vec![node.into(), id.into()],
                 ));
             }
@@ -659,7 +662,7 @@ async fn execute(
     }
 
     // delete everything that's wrong in the DB! this is useful on restore from a backup...
-    statements.push(Statement::WithParams("DELETE FROM consul_services WHERE node = ? AND id NOT IN (SELECT id FROM __corro_consul_services)".into(), vec![node.into()]));
+    statements.push(Statement::WithParams("DELETE FROM consul_services WHERE node = ? AND source IS NULL AND id NOT IN (SELECT id FROM __corro_consul_services)".into(), vec![node.into()]));
 
     let mut check_to_upsert = vec![];
     let mut check_to_delete = vec![];
@@ -677,7 +680,8 @@ async fn execute(
                     vec![id.clone().into()],
                 ));
                 statements.push(Statement::WithParams(
-                    "DELETE FROM consul_checks WHERE node = ? AND id = ?;".into(),
+                    "DELETE FROM consul_checks WHERE node = ? AND id = ? AND source IS NULL;"
+                        .into(),
                     vec![node.into(), id.into()],
                 ));
             }
@@ -685,11 +689,11 @@ async fn execute(
     }
 
     // delete everything that's wrong in the DB! this is useful on restore from a backup...
-    statements.push(Statement::WithParams("DELETE FROM consul_checks WHERE node = ? AND id NOT IN (SELECT id FROM __corro_consul_checks)".into(), vec![node.into()]));
+    statements.push(Statement::WithParams("DELETE FROM consul_checks WHERE node = ? AND source IS NULL AND id NOT IN (SELECT id FROM __corro_consul_checks)".into(), vec![node.into()]));
 
     if !statements.is_empty() {
         if let Some(e) = corrosion
-            .execute(&statements)
+            .execute(&statements, None)
             .await?
             .results
             .into_iter()
@@ -756,6 +760,7 @@ mod tests {
                 address TEXT NOT NULL DEFAULT '',
                 updated_at INTEGER NOT NULL DEFAULT 0,
                 app_id INTEGER AS (CAST(JSON_EXTRACT(meta, '$.app_id') AS INTEGER)),        
+                source TEXT,
 
                 PRIMARY KEY (node, id)
             );
@@ -769,6 +774,7 @@ mod tests {
                 status TEXT NOT NULL DEFAULT '',
                 output TEXT NOT NULL DEFAULT '',
                 updated_at INTEGER NOT NULL DEFAULT 0,
+                source TEXT,
                 PRIMARY KEY (node, id)
             );
         ",
@@ -815,20 +821,23 @@ mod tests {
         // let conn = ta1_client.pool().get().await?;
         let svc0_clone = svc0.clone();
         ta1_client
-            .execute(&[Statement::WithParams(
-                "INSERT INTO consul_services ( node, id, name, tags, meta, port, address)
+            .execute(
+                &[Statement::WithParams(
+                    "INSERT INTO consul_services ( node, id, name, tags, meta, port, address)
                      VALUES (?,?,?,?,?,?,?)"
-                    .into(),
-                vec![
-                    "node-1".into(),
-                    svc0_clone.id.into(),
-                    svc0_clone.name.into(),
-                    serde_json::to_string(&svc0_clone.tags).unwrap().into(),
-                    serde_json::to_string(&svc0_clone.meta).unwrap().into(),
-                    svc0_clone.port.into(),
-                    svc0_clone.address.into(),
-                ],
-            )])
+                        .into(),
+                    vec![
+                        "node-1".into(),
+                        svc0_clone.id.into(),
+                        svc0_clone.name.into(),
+                        serde_json::to_string(&svc0_clone.tags).unwrap().into(),
+                        serde_json::to_string(&svc0_clone.meta).unwrap().into(),
+                        svc0_clone.port.into(),
+                        svc0_clone.address.into(),
+                    ],
+                )],
+                None,
+            )
             .await?;
 
         update_hashes(&ta1_client, "node-1", &mut svc_hashes, &mut check_hashes).await?;

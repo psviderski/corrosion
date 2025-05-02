@@ -355,7 +355,7 @@ fn handle_need(
     sender: &Sender<SyncMessage>,
     last_cleared_ts: Option<Timestamp>,
 ) -> eyre::Result<()> {
-    debug!(%actor_id, "handle known versions! need: {need:?}");
+    debug!(%actor_id, self_actor_id = %agent.actor_id(), "handle known versions! need: {need:?}");
 
     let mut empties: RangeInclusiveMap<Version, Timestamp> = RangeInclusiveMap::new();
 
@@ -846,7 +846,7 @@ async fn process_sync(
     let last_ts = agent
         .clone()
         .booked()
-        .read("process_sync(read_cleared_ts))")
+        .read::<&str, _>("process_sync(read_cleared_ts))", None)
         .await
         .last_cleared_ts();
     loop {
@@ -882,7 +882,7 @@ async fn process_sync(
 
                 for (actor_id, needs) in agg {
                     let booked = bookie
-                        .read("process_sync get actor")
+                        .read::<&str, _>("process_sync get actor", None)
                         .await
                         .get(&actor_id)
                         .cloned();
@@ -890,7 +890,9 @@ async fn process_sync(
                         Some(b) => b,
                         None => continue,
                     };
-                    let booked_read = booked.read("process_sync check needs").await;
+                    let booked_read = booked
+                        .read::<&str, _>("process_sync check needs", None)
+                        .await;
 
                     for need in needs {
                         match &need {
@@ -1129,7 +1131,7 @@ pub async fn parallel_sync(
 
                     let mut needs = our_sync_state.compute_available_needs(&their_sync_state);
 
-                    trace!(%actor_id, self_actor_id = %agent.actor_id(), "computed needs");
+                    debug!(%actor_id, self_actor_id = %agent.actor_id(), "computed needs: {:?}, their_sync_state: {:?}", needs, their_sync_state);
 
                     let cleared_ts = their_sync_state.last_cleared_ts;
 
@@ -1737,7 +1739,7 @@ mod tests {
 
     use crate::{
         agent::{process_multiple_changes, setup},
-        api::public::api_v1_db_schema,
+        api::public::{api_v1_db_schema, TransactionParams},
     };
 
     use super::*;
@@ -1755,6 +1757,7 @@ mod tests {
         for i in versions_range.clone() {
             let (status_code, body) = api_v1_transactions(
                 Extension(ta1.agent.clone()),
+                axum::extract::Query(TransactionParams { timeout: None }),
                 axum::Json(vec![Statement::WithParams(
                     "INSERT OR REPLACE INTO testsblob (id,text) VALUES (?,?)".into(),
                     vec![format!("service-id-{i}").into(), "service-name".into()],
@@ -1764,7 +1767,7 @@ mod tests {
             assert_eq!(status_code, StatusCode::OK);
 
             let version = body.0.version.unwrap();
-            assert_eq!(version, Version(i));
+            assert_eq!(version, i);
         }
 
         let dir = tempfile::tempdir()?;
@@ -1804,6 +1807,7 @@ mod tests {
         _ = tracing_subscriber::fmt::try_init();
 
         let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+        let tx_timeout = Duration::from_secs(60);
 
         let dir = tempfile::tempdir()?;
 
@@ -1885,13 +1889,19 @@ mod tests {
                     Instant::now(),
                 ),
             ],
+            tx_timeout,
         )
         .await?;
 
-        let booked = bookie.read("test").await.get(&actor_id).cloned().unwrap();
+        let booked = bookie
+            .read::<&str, _>("test", None)
+            .await
+            .get(&actor_id)
+            .cloned()
+            .unwrap();
 
         {
-            let read = booked.read("test").await;
+            let read = booked.read::<&str, _>("test", None).await;
 
             assert!(read.contains_version(&Version(1)));
             assert!(read.contains_version(&Version(2)));
@@ -2002,6 +2012,7 @@ mod tests {
                 ChangeSource::Sync,
                 Instant::now(),
             )],
+            tx_timeout,
         )
         .await?;
 
@@ -2144,6 +2155,7 @@ mod tests {
                 ChangeSource::Sync,
                 Instant::now(),
             )],
+            tx_timeout,
         )
         .await?;
 
@@ -2217,6 +2229,7 @@ mod tests {
                 .iter()
                 .map(|change| (change.clone(), ChangeSource::Sync, Instant::now()))
                 .collect(),
+            tx_timeout,
         )
         .await?;
 

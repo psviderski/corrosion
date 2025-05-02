@@ -1,7 +1,11 @@
-use std::{cmp, fmt, io, num::NonZeroU32, ops::{Deref, RangeInclusive}, time::Duration};
+use std::{
+    cmp, fmt, io,
+    num::NonZeroU32,
+    ops::{Deref, RangeInclusive},
+    time::Duration,
+};
 
 use bytes::{Bytes, BytesMut};
-use corro_api_types::{row_to_change, Change};
 use foca::{Identity, Member, Notification, Runtime, Timer};
 use itertools::Itertools;
 use metrics::counter;
@@ -16,17 +20,18 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::block_in_place,
 };
-use tracing::{error, trace};
+use tracing::{debug, error, trace};
 use uhlc::{ParseNTP64Error, NTP64};
 
 use crate::{
     actor::{Actor, ActorId, ClusterId},
     agent::Agent,
     base::{CrsqlDbVersion, CrsqlSeq, Version},
-    change::{ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
+    change::{row_to_change, Change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     channel::CorroSender,
     sqlite::SqlitePoolError,
     sync::SyncTraceContextV1,
+    updates::match_changes,
 };
 
 #[derive(Debug, Clone, Readable, Writable)]
@@ -165,9 +170,14 @@ impl Changeset {
     // determine the estimated resource cost of processing a change
     pub fn processing_cost(&self) -> usize {
         match self {
-            Changeset::Empty { versions, .. } => cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20),
-            Changeset::EmptySet { versions, .. } => versions.iter().map(|versions| cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)).sum::<usize>(),
-            Changeset::Full { changes, ..} => changes.len(),
+            Changeset::Empty { versions, .. } => {
+                cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)
+            }
+            Changeset::EmptySet { versions, .. } => versions
+                .iter()
+                .map(|versions| cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20))
+                .sum::<usize>(),
+            Changeset::Full { changes, .. } => changes.len(),
         }
     }
 
@@ -508,7 +518,9 @@ pub async fn broadcast_changes(
 
                     trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
 
-                    agent.subs_manager().match_changes(&changes, db_version);
+                    debug!("match_changes db_version: {db_version}");
+                    match_changes(agent.subs_manager(), &changes, db_version);
+                    match_changes(agent.updates_manager(), &changes, db_version);
 
                     let tx_bcast = agent.tx_bcast().clone();
                     tokio::spawn(async move {

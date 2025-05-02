@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    ops::Deref,
     time::{Duration, Instant},
 };
 
@@ -18,8 +19,12 @@ use corro_types::{
     sqlite::SqlitePoolError,
 };
 use hyper::StatusCode;
+use metrics::histogram;
 use rusqlite::{params_from_iter, ToSql, Transaction};
+use serde::Deserialize;
 use spawn::spawn_counted;
+use sqlite_pool::{Committable, InterruptibleTransaction};
+
 use tokio::{
     sync::{
         mpsc::{self, channel},
@@ -33,12 +38,21 @@ use corro_types::broadcast::broadcast_changes;
 
 pub mod pubsub;
 
+pub mod update;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+pub struct TransactionParams {
+    #[serde(default)]
+    pub timeout: Option<u64>,
+}
+
 pub async fn make_broadcastable_changes<F, T>(
     agent: &Agent,
+    params: TransactionParams,
     f: F,
 ) -> Result<(T, Option<Version>, Duration), ChangeError>
 where
-    F: Fn(&Transaction) -> Result<T, ChangeError>,
+    F: Fn(&InterruptibleTransaction<Transaction>) -> Result<T, ChangeError>,
 {
     trace!("getting conn...");
     let mut conn = agent.pool().write_priority().await?;
@@ -49,7 +63,7 @@ where
     // so it probably doesn't matter too much, except for reads of internal state
     let mut book_writer = agent
         .booked()
-        .write("make_broadcastable_changes(booked writer)")
+        .write::<&str, _>("make_broadcastable_changes(booked writer)", None)
         .await;
 
     let start = Instant::now();
@@ -62,11 +76,13 @@ where
                 version: None,
             })?;
 
+        let timeout = params.timeout.map(Duration::from_secs);
+        let tx = InterruptibleTransaction::new(tx, timeout, "local_changes");
+
         // Execute whatever might mutate state data
         let ret = f(&tx)?;
 
         let insert_info = insert_local_changes(agent, &tx, &mut book_writer)?;
-
         tx.commit().map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
@@ -74,6 +90,8 @@ where
         })?;
 
         let elapsed = start.elapsed();
+        histogram!("corro.agent.changes.processing.time.seconds", "source" => "local")
+            .record(start.elapsed());
 
         match insert_info {
             None => Ok((ret, None, elapsed)),
@@ -101,7 +119,13 @@ where
 }
 
 #[tracing::instrument(skip_all, err)]
-fn execute_statement(tx: &Transaction, stmt: &Statement) -> rusqlite::Result<usize> {
+fn execute_statement<T>(
+    tx: &InterruptibleTransaction<T>,
+    stmt: &Statement,
+) -> rusqlite::Result<usize>
+where
+    T: Deref<Target = rusqlite::Connection> + Committable,
+{
     let mut prepped = tx.prepare(stmt.query())?;
 
     match stmt {
@@ -134,6 +158,7 @@ fn execute_statement(tx: &Transaction, stmt: &Statement) -> rusqlite::Result<usi
 pub async fn api_v1_transactions(
     // axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     Extension(agent): Extension<Agent>,
+    axum::extract::Query(params): axum::extract::Query<TransactionParams>,
     axum::extract::Json(statements): axum::extract::Json<Vec<Statement>>,
 ) -> (StatusCode, axum::Json<ExecResponse>) {
     if statements.is_empty() {
@@ -149,31 +174,33 @@ pub async fn api_v1_transactions(
         );
     }
 
-    let res = make_broadcastable_changes(&agent, move |tx| {
+    let res = make_broadcastable_changes(&agent, params, move |tx| {
         let mut total_rows_affected = 0;
 
         let results = statements
             .iter()
             .map(|stmt| {
                 let start = Instant::now();
-                let res = execute_statement(tx, stmt);
+                let res = execute_statement(tx, stmt).map_err(|e| ChangeError::Rusqlite {
+                    source: e,
+                    actor_id: None,
+                    version: None,
+                });
 
                 match res {
                     Ok(rows_affected) => {
                         total_rows_affected += rows_affected;
-                        ExecResult::Execute {
+                        Ok(ExecResult::Execute {
                             rows_affected,
                             time: start.elapsed().as_secs_f64(),
-                        }
+                        })
                     }
-                    Err(e) => ExecResult::Error {
-                        error: e.to_string(),
-                    },
+                    Err(e) => Err(e),
                 }
             })
-            .collect::<Vec<ExecResult>>();
+            .collect::<Result<Vec<ExecResult>, ChangeError>>();
 
-        Ok(results)
+        results
     })
     .await;
 
@@ -199,7 +226,7 @@ pub async fn api_v1_transactions(
         axum::Json(ExecResponse {
             results,
             time: elapsed.as_secs_f64(),
-            version,
+            version: version.map(Into::into),
         }),
     )
 }
@@ -445,7 +472,9 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
 
     let partial_schema = parse_sql(&new_sql)?;
 
+    info!("getting write connection to update schema");
     let mut conn = agent.pool().write_priority().await?;
+    info!("got write connection to update schema");
 
     // hold onto this lock so nothing else makes changes
     let mut schema_write = agent.schema().write();
@@ -652,6 +681,7 @@ mod tests {
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
+            axum::extract::Query(TransactionParams { timeout: None }),
             axum::Json(vec![Statement::WithParams(
                 "insert into tests (id, text) values (?,?)".into(),
                 vec!["service-id".into(), "service-name".into()],
@@ -681,12 +711,16 @@ mod tests {
             }))
         ));
 
-        assert_eq!(agent.booked().read("test").await.last(), Some(Version(1)));
+        assert_eq!(
+            agent.booked().read::<&str, _>("test", None).await.last(),
+            Some(Version(1))
+        );
 
         println!("second req...");
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
+            axum::extract::Query(TransactionParams { timeout: None }),
             axum::Json(vec![Statement::WithParams(
                 "update tests SET text = ? where id = ?".into(),
                 vec!["service-name".into(), "service-id".into()],
@@ -734,6 +768,7 @@ mod tests {
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
+            axum::extract::Query(TransactionParams { timeout: None }),
             axum::Json(vec![
                 Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),

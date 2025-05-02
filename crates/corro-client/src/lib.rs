@@ -1,6 +1,11 @@
 pub mod sub;
 
 use corro_api_types::{ChangeId, ExecResponse, ExecResult, SqliteValue, Statement};
+use hickory_resolver::{
+    error::{ResolveError, ResolveErrorKind},
+    name_server::TokioConnectionProvider,
+    AsyncResolver,
+};
 use http::uri::PathAndQuery;
 use hyper::{client::HttpConnector, http::HeaderName, Body, StatusCode};
 use serde::de::DeserializeOwned;
@@ -11,17 +16,12 @@ use std::{
     sync::Arc,
     time::{self, Duration, Instant},
 };
-use sub::{QueryStream, SubscriptionStream};
+use sub::{QueryStream, SubscriptionStream, UpdatesStream};
 use tokio::{
     sync::{RwLock, RwLockReadGuard},
     time::timeout,
 };
 use tracing::{debug, info, warn};
-use trust_dns_resolver::{
-    error::{ResolveError, ResolveErrorKind},
-    name_server::{GenericConnection, GenericConnectionProvider, TokioRuntime},
-    AsyncResolver,
-};
 use uuid::Uuid;
 
 const HTTP2_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -218,13 +218,24 @@ impl CorrosionApiClient {
         self.subscription_typed(id, skip_rows, from).await
     }
 
-    pub async fn execute(&self, statements: &[Statement]) -> Result<ExecResponse, Error> {
+    pub async fn updates_typed<T: DeserializeOwned + Unpin>(
+        &self,
+        table: &str,
+    ) -> Result<UpdatesStream<T>, Error> {
+        let p_and_q: PathAndQuery = format!("/v1/updates/{}", table).try_into()?;
+
+        let url = hyper::Uri::builder()
+            .scheme("http")
+            .authority(self.api_addr.to_string())
+            .path_and_query(p_and_q)
+            .build()?;
+
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
-            .uri(format!("http://{}/v1/transactions", self.api_addr))
+            .uri(url)
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .header(hyper::header::ACCEPT, "application/json")
-            .body(Body::from(serde_json::to_vec(statements)?))?;
+            .body(hyper::Body::empty())?;
 
         let res = self.api_client.request(req).await?;
 
@@ -232,8 +243,76 @@ impl CorrosionApiClient {
             return Err(Error::UnexpectedStatusCode(res.status()));
         }
 
-        let bytes = hyper::body::to_bytes(res.into_body()).await?;
+        // TODO: make that header name a const in corro-types
+        let id = res
+            .headers()
+            .get(HeaderName::from_static("corro-query-id"))
+            .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()))
+            .ok_or(Error::ExpectedQueryId)?;
 
+        Ok(UpdatesStream::new(id, res.into_body()))
+    }
+
+    pub async fn updates(&self, table: &str) -> Result<UpdatesStream<Vec<SqliteValue>>, Error> {
+        self.updates_typed(table).await
+    }
+
+    pub async fn execute(
+        &self,
+        statements: &[Statement],
+        timeout: Option<u64>,
+    ) -> Result<ExecResponse, Error> {
+        let uri = if let Some(timeout) = timeout {
+            format!(
+                "http://{}/v1/transactions?timeout={}",
+                self.api_addr, timeout
+            )
+        } else {
+            format!("http://{}/v1/transactions", self.api_addr)
+        };
+        println!("uri: {:?}", uri);
+        let req = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(uri)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .header(hyper::header::ACCEPT, "application/json")
+            .body(Body::from(serde_json::to_vec(statements)?))?;
+
+        let res = self.api_client.request(req).await?;
+
+        let status = res.status();
+        if !status.is_success() {
+            match hyper::body::to_bytes(res.into_body()).await {
+                Ok(b) => match serde_json::from_slice(&b) {
+                    Ok(res) => match res {
+                        ExecResponse { results, .. } => {
+                            if let Some(ExecResult::Error { error }) = results
+                                .into_iter()
+                                .find(|r| matches!(r, ExecResult::Error { .. }))
+                            {
+                                return Err(Error::ResponseError(error));
+                            }
+                            return Err(Error::UnexpectedStatusCode(status));
+                        }
+                    },
+                    Err(e) => {
+                        debug!(
+                            error = %e,
+                            "could not deserialize response body, sending generic error..."
+                        );
+                        return Err(Error::UnexpectedStatusCode(status));
+                    }
+                },
+                Err(e) => {
+                    debug!(
+                        error = %e,
+                        "could not aggregate response body bytes, sending generic error..."
+                    );
+                    return Err(Error::UnexpectedStatusCode(status));
+                }
+            }
+        }
+        let bytes = hyper::body::to_bytes(res.into_body()).await?;
         Ok(serde_json::from_slice(&bytes)?)
     }
 
@@ -397,7 +476,7 @@ impl CorrosionPooledClient {
     pub fn new(
         addrs: Vec<String>,
         stickiness_timeout: time::Duration,
-        resolver: AsyncResolver<GenericConnection, GenericConnectionProvider<TokioRuntime>>,
+        resolver: AsyncResolver<TokioConnectionProvider>,
     ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(PooledClientInner {
@@ -553,7 +632,7 @@ impl CorrosionPooledClient {
 
 struct AddrPicker {
     // Resolver used to resolve the addresses
-    resolver: AsyncResolver<GenericConnection, GenericConnectionProvider<TokioRuntime>>,
+    resolver: AsyncResolver<TokioConnectionProvider>,
     // List of addresses/hostname to try in order
     addrs: Vec<String>,
     // Next address/hostname to try
@@ -566,10 +645,7 @@ struct AddrPicker {
 }
 
 impl AddrPicker {
-    fn new(
-        addrs: Vec<String>,
-        resolver: AsyncResolver<GenericConnection, GenericConnectionProvider<TokioRuntime>>,
-    ) -> AddrPicker {
+    fn new(addrs: Vec<String>, resolver: AsyncResolver<TokioConnectionProvider>) -> AddrPicker {
         Self {
             resolver,
             addrs,
@@ -670,6 +746,7 @@ pub enum Error {
 mod tests {
     use crate::{CorrosionPooledClient, Error};
     use corro_api_types::SqliteValue;
+    use hickory_resolver::AsyncResolver;
     use hyper::{header::HeaderValue, service::service_fn, Body, Request, Response};
     use std::{
         convert::Infallible,
@@ -681,7 +758,6 @@ mod tests {
         time::Duration,
     };
     use tokio::{net::TcpListener, pin, sync::broadcast};
-    use trust_dns_resolver::AsyncResolver;
     use uuid::Uuid;
 
     struct Server {

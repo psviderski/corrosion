@@ -21,31 +21,38 @@ use tokio::{
 };
 use tracing::{debug, info_span};
 use tripwire::Tripwire;
+use uuid::Uuid;
 
 use crate::{
     agent::process_multiple_changes,
     api::{
         peer::parallel_sync,
-        public::{api_v1_db_schema, api_v1_transactions},
+        public::{api_v1_db_schema, api_v1_transactions, TransactionParams},
     },
     transport::Transport,
 };
 use corro_tests::*;
-use corro_types::agent::Agent;
 use corro_types::broadcast::Timestamp;
 use corro_types::change::Change;
 use corro_types::{
     actor::ActorId,
     agent::migrate,
-    api::{row_to_change, ExecResponse, ExecResult, Statement},
+    api::{ExecResponse, ExecResult, Statement},
     base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{ChangeSource, ChangeV1, Changeset},
     change::store_empty_changeset,
     sqlite::CrConn,
     sync::generate_sync,
 };
+use corro_types::{
+    agent::Agent,
+    api::{ColumnName, TableName},
+    change::row_to_change,
+    pubsub::pack_columns,
+};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+
 async fn insert_rows_and_gossip() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
@@ -370,57 +377,61 @@ pub async fn configurable_stress_test(
         .unwrap()
     });
 
-    let actor_versions = tokio_stream::StreamExt::map(futures::stream::iter(iter).chunks(20), {
-        let addrs = addrs.clone();
-        let client = client.clone();
-        move |statements| {
+    let actor_versions = {
+        let client: hyper::Client<_, hyper::Body> = hyper::Client::builder().build_http();
+
+        tokio_stream::StreamExt::map(futures::stream::iter(iter).chunks(20), {
             let addrs = addrs.clone();
             let client = client.clone();
-            Ok(async move {
-                let mut rng = StdRng::from_entropy();
-                let (actor_id, chosen) = addrs.iter().choose(&mut rng).unwrap();
+            move |statements| {
+                let addrs = addrs.clone();
+                let client = client.clone();
+                Ok(async move {
+                    let mut rng = StdRng::from_entropy();
+                    let (actor_id, chosen) = addrs.iter().choose(&mut rng).unwrap();
 
-                let res = client
-                    .request(
-                        hyper::Request::builder()
-                            .method(hyper::Method::POST)
-                            .uri(format!("http://{chosen}/v1/transactions"))
-                            .header(hyper::header::CONTENT_TYPE, "application/json")
-                            .body(serde_json::to_vec(&statements)?.into())?,
-                    )
-                    .await?;
+                    let res = client
+                        .request(
+                            hyper::Request::builder()
+                                .method(hyper::Method::POST)
+                                .uri(format!("http://{chosen}/v1/transactions"))
+                                .header(hyper::header::CONTENT_TYPE, "application/json")
+                                .body(serde_json::to_vec(&statements)?.into())?,
+                        )
+                        .await?;
 
-                if res.status() != StatusCode::OK {
-                    eyre::bail!("unexpected status code: {}", res.status());
-                }
-
-                let body: ExecResponse =
-                    serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
-
-                for (i, statement) in statements.iter().enumerate() {
-                    if !matches!(
-                        body.results[i],
-                        ExecResult::Execute {
-                            rows_affected: 1,
-                            ..
-                        }
-                    ) {
-                        eyre::bail!("unexpected exec result for statement {i}: {statement:?}");
+                    if res.status() != StatusCode::OK {
+                        eyre::bail!("unexpected status code: {}", res.status());
                     }
-                }
 
-                Ok::<_, eyre::Report>((*actor_id, 1))
-            })
-        }
-    })
-    .try_buffer_unordered(10)
-    .try_fold(BTreeMap::new(), |mut acc, item| {
-        {
-            *acc.entry(item.0).or_insert(0) += item.1
-        }
-        future::ready(Ok(acc))
-    })
-    .await?;
+                    let body: ExecResponse =
+                        serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
+
+                    for (i, statement) in statements.iter().enumerate() {
+                        if !matches!(
+                            body.results[i],
+                            ExecResult::Execute {
+                                rows_affected: 1,
+                                ..
+                            }
+                        ) {
+                            eyre::bail!("unexpected exec result for statement {i}: {statement:?}");
+                        }
+                    }
+
+                    Ok::<_, eyre::Report>((*actor_id, 1))
+                })
+            }
+        })
+        .try_buffer_unordered(10)
+        .try_fold(BTreeMap::new(), |mut acc, item| {
+            {
+                *acc.entry(item.0).or_insert(0) += item.1
+            }
+            future::ready(Ok(acc))
+        })
+        .await?
+    };
 
     let changes_count: i64 = 4 * input_count as i64;
 
@@ -487,10 +498,10 @@ pub async fn configurable_stress_test(
             debug!(
                 "last version: {:?}",
                 ta.bookie
-                    .write("test")
+                    .write::<&str, _>("test", None)
                     .await
                     .ensure(ta.agent.actor_id())
-                    .read("test")
+                    .read::<&str, _>("test", None)
                     .await
                     .last()
             );
@@ -593,6 +604,7 @@ pub async fn configurable_stress_test(
         );
     }
 
+    println!("waiting for things to shut down");
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
     wait_for_all_pending_handles().await;
@@ -663,7 +675,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
     let ta4_transport = Transport::new(&ta4.agent.config().gossip, rtt_tx.clone()).await?;
 
     println!("starting sync!?");
-    for _ in 0..6 {
+    for _ in 0..7 {
         let res = parallel_sync(
             &ta2.agent,
             &ta2_transport,
@@ -703,7 +715,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
 
         println!("ta4 synced {res}");
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -726,11 +738,11 @@ async fn large_tx_sync() -> eyre::Result<()> {
         println!(
             "{name}: bookie: {:?}",
             ta.bookie
-                .read("test")
+                .read::<&str, _>("test", None)
                 .await
                 .get(&ta1.agent.actor_id())
                 .unwrap()
-                .read("test")
+                .read::<&str, _>("test", None)
                 .await
                 .deref()
         );
@@ -758,7 +770,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
     for (name, actor_id, count) in ta_counts {
         assert_eq!(
             count, expected_count,
-            "{name}: actor {actor_id} did not reach 10K rows",
+            "{name}: actor {actor_id} did not reach {expected_count} rows",
         );
     }
 
@@ -785,6 +797,8 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
     let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
 
+    let tx_timeout = Duration::from_secs(60);
+
     let (rtt_tx, _rtt_rx) = mpsc::channel(1024);
     let ta2_transport = Transport::new(&ta2.agent.config().gossip, rtt_tx.clone()).await?;
     // setup the schema, for both nodes
@@ -807,7 +821,7 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     insert_rows(ta1.agent.clone(), 1, 50).await;
     // send them all
     let rows = get_rows(ta1.agent.clone(), vec![(Version(1)..=Version(50), None)]).await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
 
     // overwrite different version ranges
     insert_rows(ta1.agent.clone(), 1, 5).await;
@@ -825,7 +839,7 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
         ],
     )
     .await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
@@ -874,15 +888,15 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     let ta1_cleared = ta1
         .agent
         .booked()
-        .read("test_clear_empty")
+        .read::<&str, _>("test_clear_empty", None)
         .await
         .last_cleared_ts();
     let ta2_ta1_cleared = ta2
         .bookie
-        .write("test")
+        .write::<&str, _>("test", None)
         .await
         .ensure(ta1.agent.actor_id())
-        .read("test_clear_empty")
+        .read::<&str, _>("test_clear_empty", None)
         .await
         .last_cleared_ts();
 
@@ -904,12 +918,137 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn process_failed_changes() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let uuid = Uuid::parse_str("00000000-0000-0000-a716-446655440000")?;
+    let actor_id = ActorId(uuid);
+    // setup the schema, for both nodes
+    let (status_code, _body) = api_v1_db_schema(
+        Extension(ta1.agent.clone()),
+        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK);
+
+    let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let (status_code, _body) = api_v1_db_schema(
+        Extension(ta2.agent.clone()),
+        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK);
+
+    for i in 1..=5_i64 {
+        let (status_code, _) = api_v1_transactions(
+            Extension(ta2.agent.clone()),
+            axum::extract::Query(TransactionParams { timeout: None }),
+            axum::Json(vec![Statement::WithParams(
+                "INSERT OR REPLACE INTO tests (id,text) VALUES (?,?)".into(),
+                vec![i.into(), "service-text".into()],
+            )]),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::OK);
+    }
+    let mut good_changes =
+        get_rows(ta2.agent.clone(), vec![(Version(1)..=Version(5), None)]).await?;
+
+    let change6 = Change {
+        table: TableName("tests".into()),
+        pk: pack_columns(&vec![6i64.into()])?,
+        cid: ColumnName("text".into()),
+        val: "six".into(),
+        col_version: 1,
+        db_version: CrsqlDbVersion(6),
+        seq: CrsqlSeq(0),
+        site_id: actor_id.to_bytes(),
+        cl: 1,
+    };
+
+    let bad_change = Change {
+        table: TableName("tests".into()),
+        pk: pack_columns(&vec![6i64.into()])?,
+        cid: ColumnName("nonexistent".into()),
+        val: "six".into(),
+        col_version: 1,
+        db_version: CrsqlDbVersion(6),
+        seq: CrsqlSeq(1),
+        site_id: actor_id.to_bytes(),
+        cl: 1,
+    };
+
+    let mut rows = vec![(
+        ChangeV1 {
+            actor_id,
+            changeset: Changeset::Full {
+                version: Version(1),
+                changes: vec![change6.clone(), bad_change],
+                seqs: CrsqlSeq(0)..=CrsqlSeq(1),
+                last_seq: CrsqlSeq(1),
+                ts: Default::default(),
+            },
+        },
+        ChangeSource::Sync,
+        Instant::now(),
+    )];
+
+    rows.append(&mut good_changes);
+
+    let res = process_multiple_changes(
+        ta1.agent.clone(),
+        ta1.bookie.clone(),
+        rows,
+        Duration::from_secs(60),
+    )
+    .await;
+
+    assert!(res.is_ok());
+
+    // verify that correct versions were inserted
+    let conn = ta1.agent.pool().read().await?;
+
+    for i in 1..=5_i64 {
+        let pk = pack_columns(&[i.into()])?;
+        let crsql_dbv = conn
+            .prepare_cached(
+                r#"SELECT db_version from crsql_changes where "table" = "tests" and pk = ?"#,
+            )?
+            .query_row([pk], |row| row.get::<_, CrsqlDbVersion>(0))?;
+
+        let booked_dbv = conn.prepare_cached("SELECT db_version from __corro_bookkeeping where start_version = ? and actor_id = ?")?
+            .query_row((i, ta2.agent.actor_id()), |row| row.get::<_, CrsqlDbVersion>(0))?;
+
+        assert_eq!(crsql_dbv, booked_dbv);
+
+        let conn = ta1.agent.pool().read().await?;
+        conn.prepare_cached("SELECT text from tests where id = ?")?
+            .query_row([i], |row| row.get::<_, String>(0))?;
+    }
+
+    let res = conn
+        .prepare_cached("SELECT text from tests where id = 6")?
+        .query_row([], |row| row.get::<_, String>(0));
+    assert!(res.is_err());
+    assert_eq!(res, Err(rusqlite::Error::QueryReturnedNoRows));
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_process_multiple_changes() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
 
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
     let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
     let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let tx_timeout = Duration::from_secs(60);
 
     // setup the schema, for both nodes
     let (status_code, _body) = api_v1_db_schema(
@@ -932,7 +1071,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
 
     // sent 1-5
     let rows = get_rows(ta1.agent.clone(), vec![(Version(1)..=Version(5), None)]).await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     // check ta2 bookie
     check_bookie_versions(
         ta2.clone(),
@@ -946,7 +1085,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
 
     // sent: 1-5, 9-10
     let rows = get_rows(ta1.agent.clone(), vec![(Version(9)..=Version(10), None)]).await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     // check for gap 6-8
     check_bookie_versions(
         ta2.clone(),
@@ -969,7 +1108,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         ],
     )
     .await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     // check for gap 11-14 and 17-19
     check_bookie_versions(
         ta2.clone(),
@@ -993,7 +1132,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         ],
     )
     .await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
 
     check_bookie_versions(
         ta2.clone(),
@@ -1016,7 +1155,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         ],
     )
     .await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
@@ -1041,7 +1180,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         ],
     )
     .await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
@@ -1068,8 +1207,12 @@ async fn check_bookie_versions(
     cleared: Vec<RangeInclusive<Version>>,
 ) -> eyre::Result<()> {
     let conn = ta.agent.pool().read().await?;
-    let booked = ta.bookie.write("test").await.ensure(actor_id);
-    let bookedv = booked.read("test").await;
+    let booked = ta
+        .bookie
+        .write::<&str, _>("test", None)
+        .await
+        .ensure(actor_id);
+    let bookedv = booked.read::<&str, _>("test", None).await;
 
     for versions in complete {
         for version in versions.clone() {
@@ -1206,6 +1349,7 @@ async fn insert_rows(agent: Agent, start: i64, n: i64) {
     for i in start..=n {
         let (status_code, _) = api_v1_transactions(
             Extension(agent.clone()),
+            axum::extract::Query(TransactionParams { timeout: None }),
             axum::Json(vec![Statement::WithParams(
                 "INSERT OR REPLACE INTO tests3 (id,text,text2, num, num2) VALUES (?,?,?,?,?)"
                     .into(),
@@ -2049,6 +2193,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
     let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
     let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let tx_timeout = Duration::from_secs(60);
 
     // setup the schema, for both nodes
     let (status_code, _body) = api_v1_db_schema(
@@ -2069,6 +2214,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
 
     let (status_code, body) = api_v1_transactions(
         Extension(ta1.agent.clone()),
+        axum::extract::Query(TransactionParams { timeout: None }),
         axum::Json(vec![Statement::WithParams(
             "insert into tests (id, text) values (?,?)".into(),
             vec!["service-id".into(), "service-name".into()],
@@ -2080,7 +2226,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
 
     let version = body.0.version.unwrap();
 
-    assert_eq!(version, Version(1));
+    assert_eq!(version, 1);
 
     let conn = ta1.agent.pool().read().await?;
 
@@ -2097,7 +2243,12 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
 
     assert_eq!(
         bk,
-        vec![(ta1.agent.actor_id(), version, None, CrsqlDbVersion(1))]
+        vec![(
+            ta1.agent.actor_id(),
+            Version(version),
+            None,
+            CrsqlDbVersion(1)
+        )]
     );
 
     let mut changes = vec![];
@@ -2119,7 +2270,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
             ChangeV1 {
                 actor_id: ta1.agent.actor_id(),
                 changeset: Changeset::Full {
-                    version,
+                    version: Version(version),
                     changes,
                     seqs: CrsqlSeq(0)..=last_seq,
                     last_seq,
@@ -2129,11 +2280,13 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
             ChangeSource::Broadcast,
             Instant::now(),
         )],
+        tx_timeout,
     )
     .await?;
 
     let (status_code, body) = api_v1_transactions(
         Extension(ta1.agent.clone()),
+        axum::extract::Query(TransactionParams { timeout: None }),
         axum::Json(vec![Statement::WithParams(
             "insert or replace into tests (id, text) values (?,?)".into(),
             vec!["service-id".into(), "service-name-overwrite".into()],
@@ -2145,7 +2298,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
 
     let version = body.0.version.unwrap();
 
-    assert_eq!(version, Version(2));
+    assert_eq!(version, 2);
 
     let bk: Vec<(ActorId, Version, Option<Version>, Option<CrsqlDbVersion>)> = conn
         .prepare(
@@ -2160,7 +2313,12 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
         bk,
         vec![
             (ta1.agent.actor_id(), Version(1), Some(Version(1)), None),
-            (ta1.agent.actor_id(), version, None, Some(CrsqlDbVersion(2)))
+            (
+                ta1.agent.actor_id(),
+                Version(version),
+                None,
+                Some(CrsqlDbVersion(2))
+            )
         ]
     );
 
@@ -2181,7 +2339,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
             ChangeV1 {
                 actor_id: ta1.agent.actor_id(),
                 changeset: Changeset::Full {
-                    version,
+                    version: Version(version),
                     changes,
                     seqs: CrsqlSeq(0)..=last_seq,
                     last_seq,
@@ -2191,6 +2349,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
             ChangeSource::Broadcast,
             Instant::now(),
         )],
+        tx_timeout,
     )
     .await?;
 
@@ -2214,7 +2373,12 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
                 None,
                 Some(CrsqlDbVersion(1))
             ),
-            (ta1.agent.actor_id(), version, None, Some(CrsqlDbVersion(2)))
+            (
+                ta1.agent.actor_id(),
+                Version(version),
+                None,
+                Some(CrsqlDbVersion(2))
+            )
         ]
     );
 

@@ -2,7 +2,6 @@
 //!
 //! This module is _big_ and maybe should be split up further.
 
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 
@@ -13,9 +12,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::agent::util::log_at_pow_10;
 use crate::{
-    agent::{bi, bootstrap, uni, util, SyncClientError, ANNOUNCE_INTERVAL},
+    agent::{
+        bi, bootstrap, uni,
+        util::{log_at_pow_10, process_multiple_changes},
+        SyncClientError, ANNOUNCE_INTERVAL,
+    },
     api::peer::parallel_sync,
     transport::Transport,
 };
@@ -36,6 +38,7 @@ use corro_types::base::Version;
 use corro_types::broadcast::Timestamp;
 use corro_types::change::store_empty_changeset;
 use foca::Notification;
+use indexmap::map::Entry;
 use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
@@ -87,6 +90,7 @@ pub fn spawn_gossipserver_handler(
             gossip_server_endpoint.close(0u32.into(), b"shutting down");
         }
     });
+    info!("gossipserver_handler is done");
 }
 
 /// Spawn a task which handles all state and interactions for a given
@@ -191,7 +195,7 @@ pub fn spawn_foca_handler(agent: &Agent, tripwire: &Tripwire, conn: &quinn::Conn
 /// everyone.
 ///
 ///
-pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr) {
+pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, mut tripwire: Tripwire) {
     tokio::spawn({
         let agent = agent.clone();
         async move {
@@ -202,7 +206,12 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr) {
             tokio::pin!(timer);
 
             loop {
-                timer.as_mut().await;
+                tokio::select! {
+                    _ = &mut tripwire => {
+                        break;
+                    }
+                    _ = timer.as_mut() => {}
+                }
 
                 match bootstrap::generate_bootstrap(
                     agent.config().gossip.bootstrap.as_slice(),
@@ -576,14 +585,12 @@ pub async fn handle_emptyset(
                     while !changes.is_empty() {
                         let change = changes.pop_front().unwrap();
                         if let Some(booked) = bookie
-                            .read(format!("process_emptyset(check ts):{actor}"))
+                            .read("process_emptyset(check ts)",actor.as_simple())
                             .await
                             .get(actor)
                         {
                             let booked_read = booked
-                                .read(format!(
-                                    "process_emptyset(booked writer, ts timestamp):{actor}"
-                                ))
+                                .read("process_emptyset(booked writer, ts timestamp)", actor.as_simple())
                                 .await;
 
                             if let Some(seen_ts) = booked_read.last_cleared_ts() {
@@ -629,17 +636,19 @@ pub async fn process_emptyset(
         debug!("processing emptyset from {:?}", actor_id);
         let booked = {
             bookie
-                .write(format!(
-                    "process_emptyset(booked writer, updates timestamp):{actor_id}",
-                ))
+                .write(
+                    "process_emptyset(booked writer, updates timestamp)",
+                    actor_id.as_simple(),
+                )
                 .await
                 .ensure(actor_id)
         };
 
         let mut booked_write = booked
-            .write(format!(
-                "process_emptyset(booked writer, updates timestamp):{actor_id}"
-            ))
+            .write(
+                "process_emptyset(booked writer, updates timestamp)",
+                actor_id.as_simple(),
+            )
             .await;
 
         let mut snap = booked_write.snapshot();
@@ -682,17 +691,19 @@ pub async fn process_emptyset(
     let mut conn = agent.pool().write_low().await?;
     let booked = {
         bookie
-            .write(format!(
-                "process_emptyset(booked writer, updates timestamp):{actor_id}",
-            ))
+            .write(
+                "process_emptyset(booked writer, updates timestamp)",
+                actor_id.as_simple(),
+            )
             .await
             .ensure(actor_id)
     };
 
     let mut booked_write = booked
-        .write(format!(
-            "process_emptyset(booked writer, updates timestamp):{actor_id}"
-        ))
+        .write(
+            "process_emptyset(booked writer, updates timestamp)",
+            actor_id.as_simple(),
+        )
         .await;
 
     let tx = conn
@@ -736,6 +747,7 @@ pub async fn handle_changes(
 ) {
     let max_changes_chunk: usize = agent.config().perf.apply_queue_len;
     let max_queue_len: usize = agent.config().perf.processing_queue_len;
+    let tx_timeout: Duration = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
     let mut queue: VecDeque<(ChangeV1, ChangeSource, Instant)> = VecDeque::new();
     let mut buf = vec![];
     let mut buf_cost = 0;
@@ -747,18 +759,25 @@ pub async fn handle_changes(
         agent.config().perf.apply_queue_timeout as u64,
     ));
 
-    const MAX_SEEN_CACHE_LEN: usize = 10000;
-    const KEEP_SEEN_CACHE_SIZE: usize = 1000;
+    let max_seen_cache_len: usize = max_queue_len;
+
+    // unlikely, but max_seen_cache_len can be less than 10, in that case we want to just clear the whole cache
+    // (todo): put some validation in config instead
+    let keep_seen_cache_size: usize = if max_seen_cache_len > 10 {
+        cmp::max(10, max_seen_cache_len / 10)
+    } else {
+        0
+    };
     let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
 
     let mut drop_log_count: u64 = 0;
     // complicated loop to process changes efficiently w/ a max concurrency
     // and a minimum chunk size for bigger and faster SQLite transactions
     loop {
-        while buf_cost >= max_changes_chunk && join_set.len() < MAX_CONCURRENT {
-            // we're already bigger than the minimum size of changes batch
-            // so we want to accumulate at least that much and process them
-            // concurrently bvased on MAX_CONCURRENCY
+        while (buf_cost >= max_changes_chunk || (!queue.is_empty() && join_set.is_empty()))
+            && join_set.len() < MAX_CONCURRENT
+        {
+            // Process if we hit the chunk size OR if we have any items and available capacity
             let mut tmp_cost = 0;
             while let Some((change, src, queued_at)) = queue.pop_front() {
                 tmp_cost += change.processing_cost();
@@ -776,23 +795,13 @@ pub async fn handle_changes(
             let changes = std::mem::take(&mut buf);
             let agent = agent.clone();
             let bookie = bookie.clone();
-            join_set.spawn(async move {
-                if let Err(e) = util::process_multiple_changes(agent, bookie, changes.clone()).await
-                {
-                    error!("could not process multiple changes: {e}");
-                    changes.iter().fold(
-                        BTreeMap::new(),
-                        |mut acc: BTreeMap<ActorId, RangeInclusiveSet<Version>>, change| {
-                            acc.entry(change.0.actor_id)
-                                .or_default()
-                                .insert(change.0.versions());
-                            acc
-                        },
-                    )
-                } else {
-                    BTreeMap::new()
-                }
-            });
+            join_set.spawn(process_multiple_changes(
+                agent,
+                bookie,
+                changes.clone(),
+                tx_timeout,
+            ));
+            counter!("corro.agent.changes.batch.spawned").increment(1);
 
             buf_cost -= tmp_cost;
         }
@@ -804,13 +813,8 @@ pub async fn handle_changes(
             // but we need to drain it to free up concurrency
             res = join_set.join_next(), if !join_set.is_empty() => {
                 debug!("processed multiple changes concurrently");
-                if let Some(Ok(res)) = res {
-                    for (actor_id, versions) in res {
-                        let versions: Vec<_> = versions.into_iter().flatten().collect();
-                        for version in versions {
-                            seen.remove(&(actor_id, version));
-                        }
-                    }
+                if let Some(Ok(Err(e))) = res {
+                    error!("could not process multiple changes: {e}");
                 }
                 continue;
             },
@@ -833,24 +837,14 @@ pub async fn handle_changes(
                     let changes: Vec<_> = queue.drain(..).collect();
                     let agent = agent.clone();
                     let bookie = bookie.clone();
-                    join_set.spawn(async move {
-                        if let Err(e) = util::process_multiple_changes(agent, bookie, changes.clone()).await
-                        {
-                            error!("could not process multiple changes: {e}");
-                            changes.iter().fold(BTreeMap::new(), |mut acc: BTreeMap<ActorId, RangeInclusiveSet<Version>> , change| {
-                                acc.entry(change.0.actor_id).or_default().insert(change.0.versions());
-                                acc
-                            })
-                        } else {
-                            BTreeMap::new()
-                        }
-                    });
+                    join_set.spawn(process_multiple_changes(agent, bookie, changes.clone(), tx_timeout));
+                    counter!("corro.agent.changes.batch.spawned").increment(1);
                     buf_cost = 0;
                 }
 
-                if seen.len() > MAX_SEEN_CACHE_LEN {
+                if seen.len() > max_seen_cache_len {
                     // we don't want to keep too many entries in here.
-                    seen = seen.split_off(seen.len() - KEEP_SEEN_CACHE_SIZE);
+                    seen = seen.split_off(seen.len() - keep_seen_cache_size);
                 }
                 continue
             },
@@ -894,10 +888,7 @@ pub async fn handle_changes(
 
         let booked = {
             bookie
-                .read(format!(
-                    "handle_change(get):{}",
-                    change.actor_id.as_simple()
-                ))
+                .read("handle_change(get)", change.actor_id.as_simple())
                 .await
                 .get(&change.actor_id)
                 .cloned()
@@ -905,10 +896,7 @@ pub async fn handle_changes(
 
         if let Some(booked) = booked {
             if booked
-                .read(format!(
-                    "handle_change(contains?):{}",
-                    change.actor_id.as_simple()
-                ))
+                .read("handle_change(contains?)", change.actor_id.as_simple())
                 .await
                 .contains_all(change.versions(), change.seqs())
             {
@@ -919,12 +907,22 @@ pub async fn handle_changes(
 
         // drop old items when the queue is full.
         if queue.len() >= max_queue_len {
-            let dropped = queue.pop_front();
-            if let Some(dropped) = dropped {
-                for v in dropped.0.versions() {
-                    let _ = seen.remove(&(dropped.0.actor_id, v));
+            let mut dropped_count = 0;
+            if let Some((dropped_change, _, _)) = queue.pop_front() {
+                for v in dropped_change.versions() {
+                    if let Entry::Occupied(mut entry) = seen.entry((change.actor_id, v)) {
+                        if let Some(seqs) = dropped_change.seqs().cloned() {
+                            entry.get_mut().remove(seqs);
+                        } else {
+                            entry.remove_entry();
+                        }
+                    };
                 }
+
+                buf_cost -= dropped_change.processing_cost();
+                dropped_count += 1;
             }
+            counter!("corro.agent.changes.dropped").increment(dropped_count);
 
             log_at_pow_10("dropped old change from queue", &mut drop_log_count);
         }
@@ -1088,8 +1086,10 @@ mod tests {
     use super::*;
     use axum::{http::StatusCode, Extension, Json};
     use corro_tests::TEST_SCHEMA;
-    use corro_types::api::{Change, ColumnName, TableName};
-    use corro_types::{base::CrsqlDbVersion, base::Version, config::Config, pubsub::pack_columns};
+    use corro_types::api::{ColumnName, TableName};
+    use corro_types::{
+        base::CrsqlDbVersion, base::Version, change::Change, config::Config, pubsub::pack_columns,
+    };
     use rusqlite::Connection;
     use std::sync::Arc;
     use tokio::sync::Semaphore;
@@ -1125,6 +1125,7 @@ mod tests {
             .build()?;
         config.perf.apply_queue_len = 1;
         config.perf.processing_queue_len = 3;
+        config.perf.changes_channel_len = 1;
 
         let (agent, agent_options) = setup(config, tripwire.clone()).await?;
 
@@ -1157,7 +1158,7 @@ mod tests {
                     cid: ColumnName("text".into()),
                     val: "two override".into(),
                     col_version: 1,
-                    db_version: CrsqlDbVersion(4),
+                    db_version: CrsqlDbVersion(i as u64),
                     seq: CrsqlSeq(0),
                     site_id: agent.actor_id().to_bytes(),
                     cl: 1,
@@ -1183,8 +1184,12 @@ mod tests {
 
         sleep(Duration::from_secs(2)).await;
 
-        let bookie = bookie.read("read booked").await;
-        let booked = bookie.get(&other_actor).unwrap().read("test").await;
+        let bookie = bookie.read::<&str, _>("read booked", None).await;
+        let booked = bookie
+            .get(&other_actor)
+            .unwrap()
+            .read::<&str, _>("test", None)
+            .await;
         assert!(booked.contains_all(Version(6)..=Version(10), None));
         assert!(booked.contains_all(Version(1)..=Version(3), None));
         assert!(!booked.contains_version(&Version(5)));
