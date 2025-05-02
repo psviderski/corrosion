@@ -31,11 +31,10 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            env:
-              # Set jemalloc page size to 16K (2^14) for ARM64 Linux targets.
-              # This ensures compatibility with systems using 16K pages like Raspberry Pi OS on RPi 5.
-              # Without this configuration, the binary may fail with "<jemalloc>: Unsupported system page size".
-              JEMALLOC_SYS_WITH_LG_PAGE: 14
+            # Set jemalloc page size to 16K (2^14) for ARM64 Linux targets.
+            # This ensures compatibility with systems using 16K pages like Raspberry Pi OS on RPi 5.
+            # Without this configuration, the binary may fail with "<jemalloc>: Unsupported system page size".
+            jemalloc_page_size: 14
     runs-on: ${{ matrix.os }}
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -53,11 +52,13 @@ jobs:
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
+      - name: Configure jemalloc page size for the build
+        if: matrix.jemalloc_page_size != null
+        run: echo "JEMALLOC_SYS_WITH_LG_PAGE=${{ matrix.jemalloc_page_size }}" >> $GITHUB_ENV
+
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: corrosion
           archive: "corrosion-$target"
           target: ${{ matrix.target }}
           token: ${{ secrets.GITHUB_TOKEN }}
-        env:
-          JEMALLOC_SYS_WITH_LG_PAGE: ${{ matrix.env.JEMALLOC_SYS_WITH_LG_PAGE || '' }}
