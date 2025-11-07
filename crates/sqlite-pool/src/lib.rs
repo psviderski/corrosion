@@ -11,10 +11,7 @@ use std::{
 };
 use tracing::warn;
 
-use deadpool::{
-    async_trait,
-    managed::{self, Object},
-};
+use deadpool::managed::{self, Object};
 use metrics::counter;
 use rusqlite::{CachedStatement, InterruptHandle, Params, Transaction};
 use tokio::time::{sleep, Duration};
@@ -88,7 +85,6 @@ impl SqliteConn for rusqlite::Connection {
     }
 }
 
-#[async_trait]
 impl<T> managed::Manager for Manager<T>
 where
     T: SqliteConn,
@@ -157,7 +153,10 @@ where
         res
     }
 
-    pub fn prepare(&self, sql: &str) -> Result<InterruptibleStatement<Statement>, rusqlite::Error> {
+    pub fn prepare(
+        &self,
+        sql: &str,
+    ) -> Result<InterruptibleStatement<Statement<'_>>, rusqlite::Error> {
         let stmt = self.conn.prepare(sql)?;
         self.current_sql.store(Arc::new(Some(sql.to_string())));
         Ok(InterruptibleStatement::new(
@@ -171,7 +170,7 @@ where
     pub fn prepare_cached(
         &self,
         sql: &str,
-    ) -> Result<InterruptibleStatement<CachedStatement>, rusqlite::Error> {
+    ) -> Result<InterruptibleStatement<CachedStatement<'_>>, rusqlite::Error> {
         let stmt = self.conn.prepare_cached(sql)?;
         self.current_sql.store(Arc::new(Some(sql.to_string())));
         Ok(InterruptibleStatement::new(
@@ -263,7 +262,7 @@ pub struct InterruptibleStatement<T> {
     sql: String,
 }
 
-impl<'conn, T> InterruptibleStatement<T>
+impl<'conn, 'a, T> InterruptibleStatement<T>
 where
     T: Deref<Target = rusqlite::Statement<'conn>> + DerefMut<Target = rusqlite::Statement<'conn>>,
 {
@@ -284,6 +283,20 @@ where
     pub fn execute<P: Params>(&mut self, params: P) -> Result<usize, rusqlite::Error> {
         let token = self.interrupt_on_timeout();
         let res = self.stmt.execute(params);
+        token.cancel();
+        res
+    }
+
+    pub fn query<'rows, P: Params>(
+        &'a mut self,
+        params: P,
+    ) -> Result<rusqlite::Rows<'rows>, rusqlite::Error>
+    where
+        'conn: 'rows,
+        'a: 'rows,
+    {
+        let token = self.interrupt_on_timeout();
+        let res = self.stmt.query(params);
         token.cancel();
         res
     }
@@ -364,7 +377,7 @@ impl Committable for rusqlite::Connection {
     }
 }
 
-pub struct Statement<'conn>(rusqlite::Statement<'conn>);
+pub struct Statement<'conn>(pub rusqlite::Statement<'conn>);
 
 impl<'conn> Deref for Statement<'conn> {
     type Target = rusqlite::Statement<'conn>;

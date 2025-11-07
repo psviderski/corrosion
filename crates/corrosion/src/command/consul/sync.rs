@@ -42,7 +42,7 @@ pub async fn run<P: AsRef<Path>>(
             .into_boxed_str(),
     );
 
-    let corrosion = CorrosionClient::new(api_addr, db_path);
+    let corrosion = CorrosionClient::new(api_addr, db_path)?;
     let consul = consul_client::Client::new(config.client.clone())?;
 
     info!("Setting up corrosion for consul sync");
@@ -482,7 +482,6 @@ enum ConsulCheckOp {
     Delete { id: String },
 }
 
-///
 fn update_services(
     mut services: HashMap<String, AgentService>,
     hashes: &HashMap<String, u64>,
@@ -552,7 +551,7 @@ fn update_checks(
 
 #[derive(Debug, thiserror::Error)]
 enum UpdateError {
-    #[error("consul: {0}")]
+    #[error("consul: {0:?}")]
     Consul(#[from] consul_client::Error),
     #[error("timed out")]
     TimedOut,
@@ -759,7 +758,7 @@ mod tests {
                 port INTEGER NOT NULL DEFAULT 0,
                 address TEXT NOT NULL DEFAULT '',
                 updated_at INTEGER NOT NULL DEFAULT 0,
-                app_id INTEGER AS (CAST(JSON_EXTRACT(meta, '$.app_id') AS INTEGER)),        
+                app_id INTEGER AS (CAST(JSON_EXTRACT(meta, '$.app_id') AS INTEGER)),
                 source TEXT,
 
                 PRIMARY KEY (node, id)
@@ -799,7 +798,7 @@ mod tests {
         )
         .await?;
 
-        let ta1_client = CorrosionClient::new(ta1.agent.api_addr(), ta1.agent.db_path());
+        let ta1_client = ta1.client();
 
         setup(&ta1_client).await?;
 
@@ -917,7 +916,7 @@ mod tests {
 
         assert_eq!(svc_hashes.get("service-id"), Some(&hash_service(&svc)));
 
-        let ta2_client = CorrosionClient::new(ta2.agent.api_addr(), ta2.agent.db_path());
+        let ta2_client = ta2.client();
 
         setup(&ta2_client).await?;
 

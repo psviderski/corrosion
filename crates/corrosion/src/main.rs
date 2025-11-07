@@ -5,32 +5,27 @@ use std::{
 };
 
 use admin::AdminConn;
+// use antithesis_sdk::assert_sometimes;
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use command::{
     tls::{generate_ca, generate_client_cert, generate_server_cert},
     tpl::TemplateFlags,
 };
+use corro_admin::TracingHandle;
 use corro_api_types::SqliteParam;
 use corro_client::CorrosionApiClient;
 use corro_types::{
     actor::{ActorId, ClusterId},
     api::{ExecResult, QueryEvent, Statement},
-    base::Version,
+    base::CrsqlDbVersion,
     config::{default_admin_path, Config, ConfigError, LogFormat, OtelConfig},
 };
 use futures::StreamExt;
 use once_cell::sync::OnceCell;
-use opentelemetry::{
-    global,
-    sdk::{
-        propagation::TraceContextPropagator,
-        trace::{self, BatchConfig},
-        Resource,
-    },
-    KeyValue,
-};
+use opentelemetry::{global, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk as os;
 use rusqlite::{Connection, OptionalExtension};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{
@@ -52,54 +47,68 @@ build_info::build_info!(pub fn version);
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-fn init_tracing(cli: &Cli) -> Result<(), ConfigError> {
+fn init_tracing(cli: &Cli) -> Result<Option<TracingHandle>, ConfigError> {
+    let mut tracing_handle = None;
     if matches!(cli.command, Command::Agent) {
         let config = cli.config()?;
 
-        let directives = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+        let directives: String = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
         let (filter, diags) = tracing_filter::legacy::Filter::parse(&directives);
         if let Some(diags) = diags {
             eprintln!("While parsing env filters: {diags}, using default");
         }
 
-        global::set_text_map_propagator(TraceContextPropagator::new());
+        global::set_text_map_propagator(os::propagation::TraceContextPropagator::new());
 
         // Tracing
-        let (env_filter, _handle) = tracing_subscriber::reload::Layer::new(filter.layer());
-
+        let (env_filter, handle) = tracing_subscriber::reload::Layer::new(filter.layer());
+        tracing_handle = Some(handle);
         let sub = tracing_subscriber::registry::Registry::default().with(env_filter);
 
         if let Some(otel) = &config.telemetry.open_telemetry {
-            let otlp_exporter = opentelemetry_otlp::new_exporter().tonic().with_env();
+            let otlp_exporter = opentelemetry_otlp::SpanExporter::builder().with_tonic();
             let otlp_exporter = match otel {
                 OtelConfig::FromEnv => otlp_exporter,
                 OtelConfig::Exporter { endpoint } => otlp_exporter.with_endpoint(endpoint),
-            };
+            }
+            .build()
+            .map_err(|err| config::ConfigError::Foreign(Box::new(err)))?;
 
-            let batch_config = BatchConfig::default().with_max_queue_size(10240);
-
-            let trace_config = trace::config().with_resource(Resource::new([
-                KeyValue::new(
+            let trace_config = os::Resource::builder()
+                .with_attribute(KeyValue::new(
                     opentelemetry_semantic_conventions::resource::SERVICE_NAME,
                     "corrosion",
-                ),
-                KeyValue::new(
+                ))
+                .with_attribute(KeyValue::new(
                     opentelemetry_semantic_conventions::resource::SERVICE_VERSION,
                     VERSION,
-                ),
-                KeyValue::new(
+                ))
+                .with_attribute(KeyValue::new(
                     opentelemetry_semantic_conventions::resource::HOST_NAME,
                     hostname::get().unwrap().to_string_lossy().into_owned(),
-                ),
-            ]));
+                ))
+                .build();
 
-            let tracer = opentelemetry_otlp::new_pipeline()
-                .tracing()
-                .with_exporter(otlp_exporter)
-                .with_trace_config(trace_config)
-                .with_batch_config(batch_config)
-                .install_batch(opentelemetry::runtime::Tokio)
-                .expect("Failed to initialize OpenTelemetry OTLP exporter.");
+            let batch_processor =
+                os::trace::span_processor_with_async_runtime::BatchSpanProcessor::builder(
+                    otlp_exporter,
+                    os::runtime::Tokio,
+                )
+                .with_batch_config(
+                    os::trace::BatchConfigBuilder::default()
+                        .with_max_queue_size(10240)
+                        .build(),
+                )
+                .build();
+
+            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_resource(trace_config)
+                .with_span_processor(batch_processor)
+                .build();
+
+            use opentelemetry::trace::TracerProvider;
+            let tracer = provider.tracer("");
+            global::set_tracer_provider(provider);
 
             let sub = sub.with(tracing_opentelemetry::layer().with_tracer(tracer));
             match config.log.format {
@@ -143,16 +152,19 @@ fn init_tracing(cli: &Cli) -> Result<(), ConfigError> {
             .init();
     }
 
-    Ok(())
+    Ok(tracing_handle)
 }
 
 async fn process_cli(cli: Cli) -> eyre::Result<()> {
-    init_tracing(&cli)?;
+    let tracing_handle = init_tracing(&cli)?;
 
     match &cli.command {
-        Command::Agent => command::agent::run(cli.config()?, &cli.config_path).await?,
+        Command::Agent => {
+            command::agent::run(cli.config()?, &cli.config_path, tracing_handle).await?
+        }
 
         Command::Backup { path } => {
+            // assert_sometimes!(true, "Corrosion database is backed up");
             let db_path = cli.db_path()?;
 
             {
@@ -170,26 +182,47 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
 
                 let conn = Connection::open(&path)?;
 
-                let site_id: [u8; 16] = conn.query_row(
-                    "DELETE FROM crsql_site_id WHERE ordinal = 0 RETURNING site_id;",
-                    [],
-                    |row| row.get(0),
-                )?;
-
-                let new_ordinal: i64 = conn.query_row(
-                    "INSERT INTO crsql_site_id (site_id) VALUES (?) RETURNING ordinal;",
-                    [&site_id],
-                    |row| row.get(0),
-                )?;
-
                 let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
 
-                for table in tables {
-                    let n = conn.execute(
-                        &format!("UPDATE \"{table}\" SET site_id = ? WHERE site_id = 0"),
-                        [new_ordinal],
-                    )?;
-                    debug!("updated {n} rows in {table}");
+                let site_id: Option<[u8; 16]> = conn
+                    .query_row(
+                        "DELETE FROM crsql_site_id WHERE ordinal = 0 RETURNING site_id;",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+
+                match site_id {
+                    Some(site_id) => {
+                        let new_ordinal: i64 = conn.query_row(
+                            "INSERT INTO crsql_site_id (site_id) VALUES (?) RETURNING ordinal;",
+                            [&site_id],
+                            |row| row.get(0),
+                        )?;
+
+                        for table in tables {
+                            let n = conn.execute(
+                                &format!("UPDATE \"{table}\" SET site_id = ? WHERE site_id = 0"),
+                                [new_ordinal],
+                            )?;
+                            debug!("updated {n} rows in {table}");
+                        }
+                    }
+                    None => {
+                        // check if any tables have rows with site_id = 0 and return an error
+                        for table in tables {
+                            let exists = conn.query_row(
+                                &format!(
+                                    "SELECT EXISTS (SELECT 1 FROM \"{table}\" WHERE site_id = 0)"
+                                ),
+                                [],
+                                |row| row.get::<_, bool>(0),
+                            )?;
+                            if exists {
+                                eyre::bail!("Site id missing (but has rows in table: {table})");
+                            }
+                        }
+                    }
                 }
 
                 // clear __corro_members, this state is per actor
@@ -227,6 +260,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 eyre::bail!("corrosion is currently running, shut it down before restoring!");
             }
 
+            // assert_sometimes!(true, "Corrosion restores database from backup");
             let config = match cli.config() {
                 Ok(config) => config,
                 Err(_e) => {
@@ -365,6 +399,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             columns: show_columns,
             timer,
             param,
+            timeout,
         } => {
             let stmt = if param.is_empty() {
                 Statement::Simple(query.clone())
@@ -375,7 +410,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 )
             };
 
-            let mut query = cli.api_client()?.query(&stmt).await?;
+            let mut query = cli.api_client()?.query(&stmt, *timeout).await?;
             while let Some(res) = query.next().await {
                 match res {
                     Ok(QueryEvent::Columns(cols)) => {
@@ -485,7 +520,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             conn.send_command(corro_admin::Command::Actor(
                 corro_admin::ActorCommand::Version {
                     actor_id: ActorId(*actor_id),
-                    version: Version(*version),
+                    version: CrsqlDbVersion(*version),
                 },
             ))
             .await?;
@@ -506,6 +541,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(db_path)?;
 
             info!("Acquiring lock...");
@@ -534,6 +570,18 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
         Command::Subs(SubsCommand::List) => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
             conn.send_command(corro_admin::Command::Subs(corro_admin::SubsCommand::List))
+                .await?;
+        }
+        Command::Log(LogCommand::Set { filter }) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Log(corro_admin::LogCommand::Set {
+                filter: filter.clone(),
+            }))
+            .await?;
+        }
+        Command::Log(LogCommand::Reset) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Log(corro_admin::LogCommand::Reset))
                 .await?;
         }
     }
@@ -584,7 +632,10 @@ struct Cli {
 impl Cli {
     fn api_client(&self) -> Result<CorrosionApiClient, ConfigError> {
         API_CLIENT
-            .get_or_try_init(|| Ok(CorrosionApiClient::new(self.api_addr()?)))
+            .get_or_try_init(|| {
+                CorrosionApiClient::new(self.api_addr()?)
+                    .map_err(|err| config::ConfigError::Foreign(Box::new(err)).into())
+            })
             .cloned()
     }
 
@@ -658,7 +709,8 @@ enum Command {
         columns: bool,
         #[arg(long, default_value = "false")]
         timer: bool,
-
+        #[arg(long)]
+        timeout: Option<u64>,
         #[arg(long)]
         param: Vec<String>,
     },
@@ -706,6 +758,10 @@ enum Command {
     /// Subscription related commands
     #[command(subcommand)]
     Subs(SubsCommand),
+
+    /// Log related commands
+    #[command(subcommand)]
+    Log(LogCommand),
 }
 
 #[derive(Subcommand)]
@@ -732,7 +788,6 @@ enum ConsulCommand {
 enum SyncCommand {
     /// Generate a sync message from the current agent
     Generate,
-    /// Reconcile gaps between memory and DB
     ReconcileGaps,
 }
 
@@ -801,4 +856,12 @@ enum SubsCommand {
         #[arg(long)]
         id: Option<Uuid>,
     },
+}
+
+#[derive(Subcommand)]
+enum LogCommand {
+    /// Set the log filter
+    Set { filter: String },
+    /// Reset the log filter to default
+    Reset,
 }

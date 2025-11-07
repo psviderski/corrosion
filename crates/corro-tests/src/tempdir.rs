@@ -1,5 +1,5 @@
+use std::env;
 use std::ops::Deref;
-use std::{env, mem};
 
 pub struct TempDir(Option<tempfile::TempDir>);
 
@@ -20,7 +20,11 @@ impl Deref for TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         if env::var_os("NO_TEMPDIR_CLEANUP").is_some() {
-            mem::forget(self.0.take())
+            if let Some(dir) = &mut self.0 {
+                dir.disable_cleanup(true);
+                dbg!(dir.path().display());
+                println!("Not cleaning up temp dir {}", dir.path().display());
+            }
         }
     }
 }

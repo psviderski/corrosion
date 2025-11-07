@@ -1,13 +1,14 @@
 use std::{
-    cmp, fmt, io,
-    num::NonZeroU32,
-    ops::{Deref, RangeInclusive},
+    cmp, collections::HashMap, fmt, io, num::NonZeroU32, num::ParseIntError, ops::Deref,
     time::Duration,
 };
 
+use antithesis_sdk::assert_sometimes;
 use bytes::{Bytes, BytesMut};
+use corro_api_types::{ColumnName, SqliteValue, TableName};
+use corro_base_types::{CrsqlDbVersionRange, CrsqlSeqRange};
 use foca::{Identity, Member, Notification, Runtime, Timer};
-use itertools::Itertools;
+use indexmap::{map::Entry, IndexMap};
 use metrics::counter;
 use rusqlite::{
     types::{FromSql, FromSqlError},
@@ -21,14 +22,15 @@ use tokio::{
     task::block_in_place,
 };
 use tracing::{debug, error, trace};
-use uhlc::{ParseNTP64Error, NTP64};
+use uhlc::NTP64;
 
 use crate::{
     actor::{Actor, ActorId, ClusterId},
     agent::Agent,
-    base::{CrsqlDbVersion, CrsqlSeq, Version},
+    base::{CrsqlDbVersion, CrsqlSeq},
     change::{row_to_change, Change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     channel::CorroSender,
+    pubsub::MatchableChange,
     sqlite::SqlitePoolError,
     sync::SyncTraceContextV1,
     updates::match_changes,
@@ -92,6 +94,15 @@ pub enum BroadcastV1 {
     Change(ChangeV1),
 }
 
+#[derive(Debug, Clone, PartialEq, Readable, Writable)]
+pub struct ColumnChange {
+    pub cid: ColumnName,
+    pub val: SqliteValue,
+    pub col_version: i64,
+    pub seq: CrsqlSeq,
+    pub cl: i64,
+}
+
 #[derive(Debug, Clone, Copy, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum ChangeSource {
@@ -99,7 +110,6 @@ pub enum ChangeSource {
     Sync,
 }
 
-// TODO: shrink this by mapping primary keys to integers instead of repeating them
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub struct ChangeV1 {
     pub actor_id: ActorId,
@@ -117,21 +127,30 @@ impl Deref for ChangeV1 {
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub enum Changeset {
     Empty {
-        versions: RangeInclusive<Version>,
+        versions: CrsqlDbVersionRange,
         #[speedy(default_on_eof)]
         ts: Option<Timestamp>,
     },
     Full {
-        version: Version,
+        version: CrsqlDbVersion,
         changes: Vec<Change>,
         // cr-sqlite sequences contained in this changeset
-        seqs: RangeInclusive<CrsqlSeq>,
+        seqs: CrsqlSeqRange,
         // last cr-sqlite sequence for the complete changeset
         last_seq: CrsqlSeq,
         ts: Timestamp,
     },
     EmptySet {
-        versions: Vec<RangeInclusive<Version>>,
+        versions: Vec<CrsqlDbVersionRange>,
+        ts: Timestamp,
+    },
+    FullV2 {
+        // TODO: actor_id is duplicated here
+        actor_id: ActorId,
+        version: CrsqlDbVersion,
+        changes: ChangesetPerTable,
+        last_seq: CrsqlSeq,
+        seqs: CrsqlSeqRange,
         ts: Timestamp,
     },
 }
@@ -148,48 +167,136 @@ impl From<ChangesetParts> for Changeset {
     }
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Readable, Writable)]
+pub struct ChangesetPerTable(IndexMap<TableName, ChangesetPerTablePk>);
+
+impl ChangesetPerTable {
+    pub fn new(map: IndexMap<TableName, ChangesetPerTablePk>) -> Self {
+        Self(map)
+    }
+
+    pub fn count(&self) -> HashMap<String, usize> {
+        self.iter()
+            .map(|(table, rows)| {
+                (
+                    table.to_string(),
+                    rows.0.iter().map(|(_, cols)| cols.len()).sum(),
+                )
+            })
+            .collect()
+    }
+
+    pub fn matchable_changes(&self) -> Box<dyn Iterator<Item = MatchableChange<'_>> + '_> {
+        Box::new(self.iter().flat_map(|(table, row)| {
+            row.0.iter().flat_map(|(pk, cols)| {
+                cols.iter().map(|col| MatchableChange {
+                    table,
+                    pk,
+                    column: &col.cid,
+                    cl: col.cl,
+                })
+            })
+        }))
+    }
+
+    pub fn insert(&mut self, change: Change) -> usize {
+        let mut cost = change.estimated_column_byte_size();
+        let table_len = change.table.len();
+        let pk_len = change.pk.len();
+
+        let per_table = match self.0.entry(change.table) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(v) => {
+                cost += table_len;
+                v.insert(ChangesetPerTablePk::default())
+            }
+        };
+
+        let col_changes = match per_table.0.entry(change.pk) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(v) => {
+                cost += pk_len;
+                v.insert(Default::default())
+            }
+        };
+
+        col_changes.push(ColumnChange {
+            cid: change.cid,
+            val: change.val,
+            col_version: change.col_version,
+            seq: change.seq,
+            cl: change.cl,
+        });
+
+        cost
+    }
+
+    pub fn drain(&mut self) -> Self {
+        Self(self.0.drain(..).collect())
+    }
+}
+
+impl Deref for ChangesetPerTable {
+    type Target = IndexMap<TableName, ChangesetPerTablePk>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Readable, Writable)]
+pub struct ChangesetPerTablePk(IndexMap<Vec<u8>, Vec<ColumnChange>>);
+
 pub struct ChangesetParts {
-    pub version: Version,
+    pub version: CrsqlDbVersion,
     pub changes: Vec<Change>,
-    pub seqs: RangeInclusive<CrsqlSeq>,
+    pub seqs: CrsqlSeqRange,
     pub last_seq: CrsqlSeq,
     pub ts: Timestamp,
 }
 
 impl Changeset {
-    pub fn versions(&self) -> RangeInclusive<Version> {
+    #[inline]
+    pub fn versions(&self) -> CrsqlDbVersionRange {
         match self {
-            Changeset::Empty { versions, .. } => versions.clone(),
+            Changeset::Empty { versions, .. } => *versions,
             // todo: this returns dummy version because empty set has an array of versions.
             // probably shouldn't be doing this
-            Changeset::EmptySet { .. } => Version(0)..=Version(0),
-            Changeset::Full { version, .. } => *version..=*version,
+            Changeset::EmptySet { .. } => CrsqlDbVersionRange::empty(),
+            Changeset::Full { version, .. } => CrsqlDbVersionRange::single(*version),
+            Changeset::FullV2 { version, .. } => CrsqlDbVersionRange::single(*version),
         }
     }
 
     // determine the estimated resource cost of processing a change
     pub fn processing_cost(&self) -> usize {
         match self {
-            Changeset::Empty { versions, .. } => {
-                cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)
-            }
+            Changeset::Empty { versions, .. } => cmp::min(versions.len(), 20),
             Changeset::EmptySet { versions, .. } => versions
                 .iter()
-                .map(|versions| cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20))
+                .map(|versions| cmp::min(versions.len(), 20))
                 .sum::<usize>(),
             Changeset::Full { changes, .. } => changes.len(),
+            Changeset::FullV2 { .. } => self.len(),
         }
     }
 
     pub fn max_db_version(&self) -> Option<CrsqlDbVersion> {
-        self.changes().iter().map(|c| c.db_version).max()
-    }
-
-    pub fn seqs(&self) -> Option<&RangeInclusive<CrsqlSeq>> {
         match self {
             Changeset::Empty { .. } => None,
             Changeset::EmptySet { .. } => None,
-            Changeset::Full { seqs, .. } => Some(seqs),
+            Changeset::Full { version, .. } => Some(*version),
+            Changeset::FullV2 { version, .. } => Some(*version),
+        }
+    }
+
+    #[inline]
+    pub fn seqs(&self) -> Option<CrsqlSeqRange> {
+        match self {
+            Changeset::Empty { .. } => None,
+            Changeset::EmptySet { .. } => None,
+            Changeset::Full { seqs, .. } => Some(*seqs),
+            Changeset::FullV2 { seqs, .. } => Some(*seqs),
         }
     }
 
@@ -198,6 +305,7 @@ impl Changeset {
             Changeset::Empty { .. } => None,
             Changeset::EmptySet { .. } => None,
             Changeset::Full { last_seq, .. } => Some(*last_seq),
+            Changeset::FullV2 { last_seq, .. } => Some(*last_seq),
         }
     }
 
@@ -206,16 +314,30 @@ impl Changeset {
             Changeset::Empty { .. } => true,
             Changeset::EmptySet { .. } => true,
             Changeset::Full { seqs, last_seq, .. } => {
-                *seqs.start() == CrsqlSeq(0) && seqs.end() == last_seq
+                seqs.start_int() == 0 && seqs.end_int() == last_seq.0
+            }
+            Changeset::FullV2 { seqs, last_seq, .. } => {
+                seqs.start_int() == 0 && seqs.end_int() == last_seq.0
             }
         }
     }
 
     pub fn len(&self) -> usize {
         match self {
-            Changeset::Empty { .. } => 0, //(versions.end().0 - versions.start().0 + 1) as usize,
+            Changeset::Empty { .. } => 0,
             Changeset::EmptySet { versions, .. } => versions.len(),
             Changeset::Full { changes, .. } => changes.len(),
+            Changeset::FullV2 { changes, .. } => changes
+                .0
+                .iter()
+                .map(|(_, pk_changes)| {
+                    pk_changes
+                        .0
+                        .iter()
+                        .map(|(_, changes)| changes.len())
+                        .sum::<usize>()
+                })
+                .sum::<usize>(),
         }
     }
 
@@ -224,6 +346,7 @@ impl Changeset {
             Changeset::Empty { .. } => true,
             Changeset::EmptySet { .. } => true,
             Changeset::Full { changes, .. } => changes.is_empty(),
+            Changeset::FullV2 { changes, .. } => changes.0.is_empty(),
         }
     }
 
@@ -232,6 +355,7 @@ impl Changeset {
             Changeset::Empty { .. } => false,
             Changeset::EmptySet { .. } => true,
             Changeset::Full { .. } => false,
+            Changeset::FullV2 { .. } => false,
         }
     }
 
@@ -240,14 +364,7 @@ impl Changeset {
             Changeset::Empty { ts, .. } => *ts,
             Changeset::EmptySet { ts, .. } => Some(*ts),
             Changeset::Full { ts, .. } => Some(*ts),
-        }
-    }
-
-    pub fn changes(&self) -> &[Change] {
-        match self {
-            Changeset::Empty { .. } => &[],
-            Changeset::EmptySet { .. } => &[],
-            Changeset::Full { changes, .. } => changes,
+            Changeset::FullV2 { ts, .. } => Some(*ts),
         }
     }
 
@@ -268,6 +385,51 @@ impl Changeset {
                 last_seq,
                 ts,
             }),
+            Changeset::FullV2 {
+                actor_id,
+                version,
+                changes,
+                seqs,
+                last_seq,
+                ts,
+            } => {
+                let changes = changes
+                    .0
+                    .into_iter()
+                    .flat_map(|(table, pk_changes)| {
+                        pk_changes.0.into_iter().flat_map(move |(pk, row)| {
+                            let table = table.clone();
+                            row.into_iter().map(move |col_change| Change {
+                                table: table.clone(),
+                                pk: pk.clone(),
+                                cid: col_change.cid,
+                                val: col_change.val,
+                                col_version: col_change.col_version,
+                                db_version: version,
+                                seq: col_change.seq,
+                                site_id: actor_id.to_bytes(),
+                                cl: col_change.cl,
+                            })
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                Some(ChangesetParts {
+                    version,
+                    changes,
+                    seqs,
+                    last_seq,
+                    ts,
+                })
+            }
+        }
+    }
+
+    pub fn matchable_changes(&self) -> Box<dyn Iterator<Item = MatchableChange<'_>> + '_> {
+        match self {
+            Changeset::Full { changes, .. } => Box::new(changes.iter().map(MatchableChange::from)),
+            Changeset::FullV2 { changes, .. } => Box::new(changes.matchable_changes()),
+            Changeset::Empty { .. } | Changeset::EmptySet { .. } => Box::new(std::iter::empty()),
         }
     }
 }
@@ -275,7 +437,7 @@ impl Changeset {
 #[derive(Debug, thiserror::Error)]
 pub enum TimestampParseError {
     #[error("could not parse timestamp: {0:?}")]
-    Parse(ParseNTP64Error),
+    Parse(ParseIntError),
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, Eq, PartialOrd, Ord)]
@@ -293,7 +455,11 @@ impl Timestamp {
     }
 
     pub fn zero() -> Self {
-        Timestamp(NTP64(0))
+        Timestamp::from(0u64)
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.0 .0 == 0
     }
 }
 
@@ -337,12 +503,18 @@ impl From<NTP64> for Timestamp {
     }
 }
 
+impl From<u64> for Timestamp {
+    fn from(value: u64) -> Self {
+        Self(NTP64(value))
+    }
+}
+
 impl FromSql for Timestamp {
     fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
         match value {
             rusqlite::types::ValueRef::Text(b) => match std::str::from_utf8(b) {
-                Ok(s) => match s.parse::<NTP64>() {
-                    Ok(ntp) => Ok(Timestamp(ntp)),
+                Ok(s) => match s.parse::<u64>() {
+                    Ok(ntp) => Ok(Timestamp(NTP64(ntp))),
                     Err(e) => Err(FromSqlError::Other(Box::new(TimestampParseError::Parse(e)))),
                 },
                 Err(e) => Err(FromSqlError::Other(Box::new(e))),
@@ -355,7 +527,7 @@ impl FromSql for Timestamp {
 impl ToSql for Timestamp {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         Ok(rusqlite::types::ToSqlOutput::Owned(
-            rusqlite::types::Value::Text(self.0.to_string()),
+            rusqlite::types::Value::Text(self.0.as_u64().to_string()),
         ))
     }
 }
@@ -419,13 +591,13 @@ pub enum BroadcastInput {
 pub struct DispatchRuntime<T> {
     pub to_send: CorroSender<(T, Bytes)>,
     pub to_schedule: CorroSender<(Duration, Timer<T>)>,
-    pub notifications: CorroSender<Notification<T>>,
+    pub notifications: CorroSender<foca::OwnedNotification<T>>,
     pub active: bool,
     pub buf: BytesMut,
 }
 
 impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
-    fn notify(&mut self, notification: Notification<T>) {
+    fn notify(&mut self, notification: Notification<'_, T>) {
         match &notification {
             Notification::Active => {
                 self.active = true;
@@ -436,7 +608,7 @@ impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
             _ => {}
         };
 
-        if let Err(e) = self.notifications.try_send(notification) {
+        if let Err(e) = self.notifications.try_send(notification.to_owned()) {
             counter!("corro.channel.error", "type" => "full", "name" => "dispatch.notifications")
                 .increment(1);
             error!("error dispatching notification: {e}");
@@ -467,7 +639,7 @@ impl<T> DispatchRuntime<T> {
     pub fn new(
         to_send: CorroSender<(T, Bytes)>,
         to_schedule: CorroSender<(Duration, Timer<T>)>,
-        notifications: CorroSender<Notification<T>>,
+        notifications: CorroSender<foca::OwnedNotification<T>>,
     ) -> Self {
         Self {
             to_send,
@@ -491,11 +663,11 @@ pub async fn broadcast_changes(
     agent: Agent,
     db_version: CrsqlDbVersion,
     last_seq: CrsqlSeq,
-    version: Version,
     ts: Timestamp,
 ) -> Result<(), BroadcastError> {
     let actor_id = agent.actor_id();
     let conn = agent.pool().read().await?;
+    trace!("got conn for broadcast");
 
     block_in_place(|| {
         // TODO: make this more generic so both sync and local changes can use it.
@@ -504,6 +676,7 @@ pub async fn broadcast_changes(
                 SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
                     FROM crsql_changes
                     WHERE db_version = ?
+                    AND site_id = crsql_site_id()
                     ORDER BY seq ASC
             "#,
         )?;
@@ -512,29 +685,32 @@ pub async fn broadcast_changes(
         for changes_seqs in chunked {
             match changes_seqs {
                 Ok((changes, seqs)) => {
-                    for (table_name, count) in changes.iter().counts_by(|change| &change.table) {
-                        counter!("corro.changes.committed", "table" => table_name.to_string(), "source" => "local").increment(count as u64);
+                    for (table_name, count) in changes.count() {
+                        counter!("corro.changes.committed", "table" => table_name, "source" => "local").increment(count as u64);
                     }
 
                     trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
 
                     debug!("match_changes db_version: {db_version}");
-                    match_changes(agent.subs_manager(), &changes, db_version);
-                    match_changes(agent.updates_manager(), &changes, db_version);
+                    let changeset = Changeset::FullV2 {
+                        actor_id,
+                        version: db_version,
+                        changes,
+                        seqs,
+                        last_seq,
+                        ts,
+                    };
+                    match_changes(agent.subs_manager(), &changeset, db_version);
+                    match_changes(agent.updates_manager(), &changeset, db_version);
 
                     let tx_bcast = agent.tx_bcast().clone();
+                    assert_sometimes!(true, "Corrosion broadcasts changes");
                     tokio::spawn(async move {
                         if let Err(e) = tx_bcast
                             .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
                                 ChangeV1 {
                                     actor_id,
-                                    changeset: Changeset::Full {
-                                        version,
-                                        changes,
-                                        seqs,
-                                        last_seq,
-                                        ts,
-                                    },
+                                    changeset,
                                 },
                             )))
                             .await

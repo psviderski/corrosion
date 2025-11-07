@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
 use corro_agent::agent::start_with_config;
+// Reexport CorrosionClient and CorrosionApiClient
+pub use corro_client::{CorrosionApiClient, CorrosionClient};
 use corro_types::{
     agent::{Agent, Bookie},
     config::{Config, ConfigBuilder, ConfigBuilderError},
+    sqlite::{rusqlite_to_crsqlite, SqlitePool},
 };
 use tripwire::Tripwire;
 
@@ -77,14 +80,7 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
     tokio::fs::create_dir(&schema_path).await?;
     tokio::fs::write(schema_path.join("tests.sql"), TEST_SCHEMA.as_bytes()).await?;
 
-    let schema_paths = conf.db.schema_paths.clone();
-
-    let (agent, bookie) = start_with_config(conf.clone(), tripwire).await?;
-
-    {
-        let client = corro_client::CorrosionApiClient::new(agent.api_addr());
-        client.schema_from_paths(&schema_paths).await?;
-    }
+    let (agent, bookie, _, _) = start_with_config(conf.clone(), tripwire).await?;
 
     Ok(TestAgent {
         agent,
@@ -92,4 +88,71 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
         tmpdir: Arc::new(tmpdir),
         config: conf,
     })
+}
+
+impl TestAgent {
+    pub fn client(&self) -> CorrosionClient {
+        CorrosionClient::new(self.agent.api_addr(), self.agent.db_path()).unwrap()
+    }
+
+    pub fn api_client(&self) -> CorrosionApiClient {
+        CorrosionApiClient::new(self.agent.api_addr()).unwrap()
+    }
+
+    // Use for out-of-band inserts
+    pub fn oob_pool(&self) -> SqlitePool {
+        sqlite_pool::Config::new(self.agent.db_path())
+            .max_size(1)
+            .create_pool_transform(rusqlite_to_crsqlite)
+            .unwrap()
+    }
+}
+
+/// Clone a test agent by copying its database using VACUUM INTO
+/// This ensures identical database state without re-running setup logic
+pub async fn clone_test_agent(source: &TestAgent, tripwire: Tripwire) -> eyre::Result<TestAgent> {
+    let tmpdir = TempDir::new(tempfile::tempdir()?);
+    let schema_path = tmpdir.path().join("schema");
+    let target_db_path = tmpdir.path().join("corrosion.db");
+
+    // Use VACUUM INTO to clone the database
+    let source_conn = source.agent.pool().read().await?;
+    source_conn.execute("VACUUM INTO ?", [target_db_path.display().to_string()])?;
+    drop(source_conn);
+
+    // Create config for new agent with cloned DB
+    let conf = Config::builder()
+        .api_addr("127.0.0.1:0".parse()?)
+        .gossip_addr("127.0.0.1:0".parse()?)
+        .admin_path(tmpdir.path().join("admin.sock").display().to_string())
+        .db_path(target_db_path.display().to_string())
+        .add_schema_path(schema_path.display().to_string())
+        .build()?;
+
+    // Copy schema files
+    tokio::fs::create_dir(&schema_path).await?;
+    for entry in std::fs::read_dir(source.tmpdir.path().join("schema"))? {
+        let entry = entry?;
+        if entry.path().is_file() {
+            let file_name = entry.file_name();
+            tokio::fs::copy(entry.path(), schema_path.join(&file_name)).await?;
+        }
+    }
+
+    let (agent, bookie, _, _) = start_with_config(conf.clone(), tripwire).await?;
+
+    Ok(TestAgent {
+        agent,
+        bookie,
+        tmpdir: Arc::new(tmpdir),
+        config: conf,
+    })
+}
+
+impl Drop for TestAgent {
+    fn drop(&mut self) {
+        if std::env::var_os("NO_TEMPDIR_CLEANUP").is_some() {
+            println!("Dropping test agent {}", self.agent.actor_id());
+        }
+    }
 }

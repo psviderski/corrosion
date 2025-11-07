@@ -12,6 +12,8 @@ use tokio::{
     time::sleep,
 };
 
+use crate::persistent_gauge;
+
 /// A tokio channel wrapper sender that tracks various metrics
 pub struct CorroSender<T> {
     send_count: Counter,
@@ -54,7 +56,8 @@ pub fn bounded<T: Send + 'static>(
     capacity: usize,
     label: &'static str,
 ) -> (CorroSender<T>, CorroReceiver<T>) {
-    gauge!("corro.runtime.channel.max_capacity", "channel_name" => label).set(capacity as f64);
+    persistent_gauge!("corro.runtime.channel.max_capacity", "channel_name" => label)
+        .set(capacity as f64);
 
     // Count the number of sends and receives going through the channel
     let send_count = counter!("corro.runtime.channel.send_count", "channel_name" => label);
@@ -100,27 +103,23 @@ impl<T> CorroSender<T> {
         self.inner
             .send(value)
             .await
-            .map(|r| {
+            .inspect(|_r| {
                 self.send_time.record(before.elapsed().as_secs_f64());
                 self.send_count.increment(1);
-                r
             })
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 self.failed_sends.increment(1);
-                e
             })
     }
 
     pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
         self.inner
             .try_send(value)
-            .map(|r| {
+            .inspect(|_r| {
                 self.send_count.increment(1);
-                r
             })
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 self.failed_sends.increment(1);
-                e
             })
     }
 
@@ -128,14 +127,12 @@ impl<T> CorroSender<T> {
         let before = Instant::now();
         self.inner
             .blocking_send(value)
-            .map(|r| {
+            .inspect(|_r| {
                 self.send_time.record(before.elapsed().as_secs_f64());
                 self.send_count.increment(1);
-                r
             })
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 self.failed_sends.increment(1);
-                e
             })
     }
 
@@ -148,37 +145,32 @@ impl<T> CorroSender<T> {
         self.inner
             .send_timeout(value, timeout)
             .await
-            .map(|r| {
+            .inspect(|_r| {
                 self.send_time.record(before.elapsed().as_secs_f64());
                 self.send_count.increment(1);
-                r
             })
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 self.failed_sends.increment(1);
-                e
             })
     }
 }
 
 impl<T> CorroReceiver<T> {
     pub async fn recv(&mut self) -> Option<T> {
-        self.inner.recv().await.map(|r| {
+        self.inner.recv().await.inspect(|_r| {
             self.recv_count.increment(1);
-            r
         })
     }
 
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-        self.inner.try_recv().map(|r| {
+        self.inner.try_recv().inspect(|_r| {
             self.recv_count.increment(1);
-            r
         })
     }
 
     pub fn blocking_recv(&mut self) -> Option<T> {
-        self.inner.blocking_recv().map(|r| {
+        self.inner.blocking_recv().inspect(|_r| {
             self.recv_count.increment(1);
-            r
         })
     }
 }

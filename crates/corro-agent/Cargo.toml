@@ -3,9 +3,14 @@ name = "corro-agent"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
+antithesis_sdk = { workspace = true }
 arc-swap = { workspace = true }
 axum = { workspace = true }
+axum-extra = { version = "0.10", features = ["typed-header"] }
 backoff = { path = "../backoff" }
 bincode = { workspace = true }
 bytes = { workspace = true }
@@ -13,16 +18,22 @@ camino = { workspace = true }
 compact_str = { workspace = true }
 config = { workspace = true }
 corro-types = { path = "../corro-types" }
+corro-utils = { path = "../corro-utils" }
 eyre = { workspace = true }
 foca = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 hickory-resolver = { workspace = true }
+http.workspace = true
+http-body.workspace = true
+http-body-util = { version = "0.1", features = ["channel"] }
 hyper = { workspace = true }
+hyper-util.workspace = true
 itertools = { workspace = true }
 metrics = { workspace = true }
 opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
+pin-project-lite.workspace = true
 quinn = { workspace = true }
 quinn-proto = { workspace = true }
 quinn-plaintext = { workspace = true }
@@ -31,7 +42,6 @@ rand = { workspace = true }
 rangemap = { workspace = true }
 rusqlite = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = "*"
 seahash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -60,4 +70,10 @@ governor.workspace = true
 
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }
+reqwest.workspace = true
 http-body = { workspace = true }
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "process_changes"
+harness = false

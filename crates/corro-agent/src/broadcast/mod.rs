@@ -11,9 +11,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bincode::DefaultOptions;
 use bytes::{BufMut, Bytes, BytesMut};
-use foca::{BincodeCodec, Foca, Identity, NoCustomBroadcast, Notification, Timer};
+use foca::{BincodeCodec, Foca, Identity, Member, NoCustomBroadcast, OwnedNotification, Timer};
 use futures::{
     stream::{FusedStream, FuturesUnordered},
     Future,
@@ -34,13 +33,14 @@ use tokio::{
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Encoder, LengthDelimitedCodec};
 use tracing::{debug, error, log::info, trace, warn};
-use tripwire::Tripwire;
+use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 
 use corro_types::{
     actor::{Actor, ActorId},
     agent::Agent,
     broadcast::{BroadcastInput, DispatchRuntime, FocaCmd, FocaInput, UniPayload, UniPayloadV1},
     channel::{bounded, CorroReceiver, CorroSender},
+    sqlite::unnest_param,
 };
 
 use crate::{agent::util::log_at_pow_10, transport::Transport};
@@ -94,7 +94,7 @@ impl TimerSpawner {
 }
 
 fn handle_timer(
-    foca: &mut Foca<Actor, BincodeCodec<DefaultOptions>, StdRng, NoCustomBroadcast>,
+    foca: &mut Foca<Actor, BincodeCodec<bincode::config::Configuration>, StdRng, NoCustomBroadcast>,
     runtime: &mut DispatchRuntime<Actor>,
     timer_rx: &mut mpsc::Receiver<(Timer<Actor>, Instant)>,
     timer: Timer<Actor>,
@@ -126,11 +126,12 @@ pub fn runtime_loop(
     mut rx_foca: CorroReceiver<FocaInput>,
     rx_bcast: CorroReceiver<BroadcastInput>,
     to_send_tx: CorroSender<(Actor, Bytes)>,
-    notifications_tx: CorroSender<Notification<Actor>>,
+    notifications_tx: CorroSender<OwnedNotification<Actor>>,
     tripwire: Tripwire,
+    member_states: Vec<(SocketAddr, Member<Actor>)>,
 ) {
     debug!("starting runtime loop for actor: {actor:?}");
-    let rng = StdRng::from_entropy();
+    let rng = StdRng::from_os_rng();
 
     let config = Arc::new(RwLock::new(make_foca_config(1.try_into().unwrap())));
 
@@ -138,7 +139,7 @@ pub fn runtime_loop(
         actor,
         config.read().clone(),
         rng,
-        foca::BincodeCodec(bincode::DefaultOptions::new()),
+        foca::BincodeCodec(bincode::config::Configuration::default()),
         NoCustomBroadcast,
     );
 
@@ -151,11 +152,16 @@ pub fn runtime_loop(
     let (timer_tx, mut timer_rx) = mpsc::channel(10);
     let timer_spawner = TimerSpawner::new(timer_tx);
 
-    tokio::spawn(async move {
-        while let Some((duration, timer)) = to_schedule_rx.recv().await {
-            timer_spawner.spawn((duration, timer));
-        }
-    });
+    {
+        let mut tripwire = tripwire.clone();
+        spawn_counted(async move {
+            while let Outcome::Completed(Some((duration, timer))) =
+                to_schedule_rx.recv().preemptible(&mut tripwire).await
+            {
+                timer_spawner.spawn((duration, timer));
+            }
+        });
+    }
 
     let cluster_size = Arc::new(AtomicU32::new(1));
 
@@ -170,7 +176,10 @@ pub fn runtime_loop(
             let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
             let mut last_cluster_size = unsafe { NonZeroU32::new_unchecked(1) };
 
-            let mut last_states = HashMap::new();
+            let mut last_states = member_states
+                .into_iter()
+                .map(|(_, member)| (member.id().id(), (member, None)))
+                .collect::<HashMap<_, _>>();
             let mut diff_last_states_every = tokio::time::interval(Duration::from_secs(60));
 
             #[derive(EnumDiscriminants)]
@@ -256,7 +265,8 @@ pub fn runtime_loop(
                         }
                         FocaInput::ApplyMany(updates) => {
                             trace!("handling FocaInput::ApplyMany");
-                            if let Err(e) = foca.apply_many(updates.into_iter(), &mut runtime) {
+                            if let Err(e) = foca.apply_many(updates.into_iter(), true, &mut runtime)
+                            {
                                 error!("foca apply_many error: {e}");
                             }
                         }
@@ -375,7 +385,7 @@ pub fn runtime_loop(
         }
     });
 
-    tokio::spawn(handle_broadcasts(
+    spawn_counted(handle_broadcasts(
         agent,
         rx_bcast,
         transport,
@@ -430,7 +440,7 @@ async fn handle_broadcasts(
 
     let mut metrics_interval = interval(Duration::from_secs(10));
 
-    let mut rng = StdRng::from_entropy();
+    let mut rng = StdRng::from_os_rng();
 
     let mut idle_pendings =
         FuturesUnordered::<Pin<Box<dyn Future<Output = PendingBroadcast> + Send + 'static>>>::new();
@@ -585,6 +595,7 @@ async fn handle_broadcasts(
         }
 
         let prev_rate_limited = rate_limited;
+        rate_limited = false;
 
         // start with local broadcasts, they're higher priority
         let mut ring0 = HashSet::new();
@@ -813,7 +824,7 @@ fn drop_oldest_broadcast(
 
 fn diff_member_states(
     agent: &Agent,
-    foca: &Foca<Actor, BincodeCodec<DefaultOptions>, StdRng, NoCustomBroadcast>,
+    foca: &Foca<Actor, BincodeCodec<bincode::config::Configuration>, StdRng, NoCustomBroadcast>,
     last_states: &mut HashMap<ActorId, (foca::Member<Actor>, Option<u64>)>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let mut foca_states = HashMap::new();
@@ -832,11 +843,17 @@ fn diff_member_states(
     }
 
     let members = agent.members().read();
+    let member_id = agent.config().gossip.member_id;
 
     let to_update = foca_states
         .iter()
         .filter_map(|(id, member)| {
             let member = *member;
+
+            if member.id().member_id() != member_id {
+                return None;
+            }
+
             let rtt = members
                 .rtts
                 .get(&member.id().addr())
@@ -844,7 +861,10 @@ fn diff_member_states(
             match last_states.entry(*id) {
                 Entry::Occupied(mut entry) => {
                     let (prev_member, prev_rtt) = entry.get();
-                    if prev_member != member || *prev_rtt != rtt {
+                    let member_differed = prev_member != member;
+                    let rtt_differed = *prev_rtt != rtt;
+                    if member_differed || rtt_differed {
+                        debug!("member differed? {member_differed}, rtt differed? {rtt_differed} (prev: {prev_rtt:?}, new: {rtt:?})");
                         entry.insert((member.clone(), rtt));
                         Some((member.clone(), rtt))
                     } else {
@@ -862,7 +882,8 @@ fn diff_member_states(
     let mut to_delete = vec![];
 
     last_states.retain(|id, _v| {
-        if foca_states.contains_key(id) {
+        let foca_state = foca_states.get(id);
+        if foca_state.is_some() && foca_state.unwrap().id().member_id() == member_id {
             true
         } else {
             to_delete.push(*id);
@@ -898,39 +919,47 @@ fn diff_member_states(
         let res = block_in_place(|| {
             let tx = conn.immediate_transaction()?;
 
-            for (member, rtt_min) in to_update {
-                let foca_state = serde_json::to_string(&member).unwrap();
+            upserted += tx
+                .prepare_cached(
+                    "
+                INSERT INTO __corro_members (actor_id, address, foca_state, rtt_min, updated_at)
+                    SELECT                   value0,   value1,  value2,     value3, value4
+                    FROM              unnest(?,        ?,       ?,          ?,       ?)
+                    -- Otherwise sqlite will think ON CONFLICT is part of a JOIN
+                    WHERE true
+                    ON CONFLICT (actor_id)
+                        DO UPDATE SET
+                            foca_state = excluded.foca_state,
+                            address = excluded.address,
+                            rtt_min = COALESCE(excluded.rtt_min, rtt_min),
+                            updated_at = excluded.updated_at
+                        WHERE excluded.updated_at > updated_at
+            ",
+                )?
+                .execute(params![
+                    unnest_param(to_update.iter().map(|(member, _)| member.id().id())),
+                    unnest_param(
+                        to_update
+                            .iter()
+                            .map(|(member, _)| member.id().addr().to_string())
+                    ),
+                    unnest_param(
+                        to_update
+                            .iter()
+                            .map(|(member, _)| serde_json::to_string(&member).unwrap())
+                    ),
+                    unnest_param(to_update.iter().map(|(_, rtt_min)| rtt_min)),
+                    unnest_param(to_update.iter().map(|_| updated_at)),
+                ])?;
 
-                upserted += tx
-                    .prepare_cached(
-                        "
-                    INSERT INTO __corro_members (actor_id, address, foca_state, rtt_min, updated_at)
-                        VALUES                  (?,        ?,       ?,          ?,       ?)
-                        ON CONFLICT (actor_id)
-                            DO UPDATE SET
-                                foca_state = excluded.foca_state,
-                                address = excluded.address,
-                                rtt_min = CASE excluded.rtt_min WHEN NULL THEN rtt_min ELSE excluded.rtt_min END,
-                                updated_at = excluded.updated_at
-                            WHERE excluded.updated_at > updated_at
-                ",
-                    )?
-                    .execute(params![
-                        member.id().id(),
-                        member.id().addr().to_string(),
-                        foca_state,
-                        rtt_min,
-                        updated_at
-                    ])?;
-            }
-
-            for id in to_delete {
-                deleted += tx
-                    .prepare_cached(
-                        "DELETE FROM __corro_members WHERE actor_id = ? AND updated_at < ?",
-                    )?
-                    .execute(params![id, updated_at])?;
-            }
+            deleted += tx
+                .prepare_cached(
+                    r#"DELETE FROM __corro_members 
+                            WHERE actor_id IN (SELECT value0 FROM UNNEST(?)) 
+                            AND updated_at < ?
+                        "#,
+                )?
+                .execute(params![unnest_param(to_delete.iter()), updated_at])?;
 
             tx.commit()?;
 
@@ -1044,7 +1073,7 @@ mod tests {
     use crate::agent::spawn_unipayload_handler;
     use corro_tests::launch_test_agent;
     use corro_types::{
-        base::{CrsqlSeq, Version},
+        base::{dbsr, CrsqlDbVersion, CrsqlSeq},
         broadcast::{BroadcastV1, ChangeV1, Changeset},
     };
     use uuid::Uuid;
@@ -1123,21 +1152,22 @@ mod tests {
             ta2_gossip_addr,
             Default::default(),
             ta1.agent.cluster_id(),
+            None,
         );
         ta1.agent.members().write().add_member(&ta2_actor);
 
         let bcast = BroadcastV1::Change(ChangeV1 {
             actor_id: ta1.agent.actor_id(),
             changeset: Changeset::Full {
-                version: Version(0),
+                version: CrsqlDbVersion(0),
                 changes: vec![],
-                seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                seqs: dbsr!(0, 0),
                 last_seq: CrsqlSeq(0),
                 ts: Default::default(),
             },
         });
         let mut ser_buf = BytesMut::new();
-        let _ = UniPayload::V1 {
+        UniPayload::V1 {
             data: UniPayloadV1::Broadcast(bcast),
             cluster_id: ta1.agent.cluster_id(),
         }
@@ -1162,9 +1192,9 @@ mod tests {
                 .send(BroadcastInput::Rebroadcast(BroadcastV1::Change(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(i),
+                        version: CrsqlDbVersion(i),
                         changes: vec![],
-                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                        seqs: dbsr!(0, 0),
                         last_seq: CrsqlSeq(0),
                         ts: Default::default(),
                     },
@@ -1184,7 +1214,10 @@ mod tests {
                 let changes = tokio::time::timeout(Duration::from_secs(5), rx_changes.recv())
                     .await?
                     .unwrap();
-                assert_eq!(changes.0.versions(), Version(i)..=Version(i));
+                assert_eq!(
+                    changes.0.versions(),
+                    (CrsqlDbVersion(i)..=CrsqlDbVersion(i)).into()
+                );
             }
         }
 

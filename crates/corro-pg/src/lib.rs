@@ -1,47 +1,47 @@
+mod codec;
 pub mod sql_state;
+mod ssl;
+pub mod utils;
 mod vtab;
 
+use eyre::WrapErr;
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     fmt,
-    future::poll_fn,
     net::SocketAddr,
+    rc::Rc,
     str::{FromStr, Utf8Error},
     sync::Arc,
     time::Duration,
 };
 
-use bytes::Buf;
 use chrono::NaiveDateTime;
+use codec::PgWireMessageServerCodec;
 use compact_str::CompactString;
 use corro_types::{
     agent::{Agent, ChangeError},
-    broadcast::broadcast_changes,
+    broadcast::{broadcast_changes, Timestamp},
     change::{insert_local_changes, InsertChangesInfo},
     config::PgConfig,
+    persistent_gauge,
     schema::{parse_sql, Column, Schema, SchemaError, SqliteType, Table},
     sqlite::CrConn,
 };
 use fallible_iterator::FallibleIterator;
 use futures::{SinkExt, StreamExt};
+use metrics::counter;
 use pgwire::{
-    api::{
-        results::{DataRowEncoder, FieldFormat, FieldInfo, Tag},
-        ClientInfo, ClientInfoHolder,
-    },
+    api::results::{DataRowEncoder, FieldFormat, FieldInfo, Tag},
     error::{ErrorInfo, PgWireError},
     messages::{
         data::{NoData, ParameterDescription, RowDescription},
         extendedquery::{BindComplete, CloseComplete, ParseComplete, PortalSuspended},
         response::{
-            CommandComplete, EmptyQueryResponse, ErrorResponse, ReadyForQuery,
-            READY_STATUS_FAILED_TRANSACTION_BLOCK, READY_STATUS_IDLE,
-            READY_STATUS_TRANSACTION_BLOCK,
+            CommandComplete, EmptyQueryResponse, ErrorResponse, ReadyForQuery, TransactionStatus,
         },
-        startup::{ParameterStatus, SslRequest},
+        startup::ParameterStatus,
         PgWireBackendMessage, PgWireFrontendMessage,
     },
-    tokio::PgWireMessageServerCodec,
 };
 use postgres_types::{FromSql, Type};
 use rusqlite::{
@@ -53,24 +53,25 @@ use socket2::{SockRef, TcpKeepalive};
 use spawn::spawn_counted;
 use sqlite3_parser::ast::{
     As, Cmd, ColumnDefinition, CreateTableBody, Expr, FromClause, Id, InsertBody, Limit, Literal,
-    Name, OneSelect, ResultColumn, Select, SelectBody, SelectTable, Stmt, With,
+    Name, OneSelect, QualifiedName, ResultColumn, Select, SelectBody, SelectTable, Stmt, With,
 };
 use sqlparser::ast::Statement as PgStatement;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, ReadBuf},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     sync::{
         mpsc::{channel, Sender},
         AcquireError, OwnedSemaphorePermit,
     },
+    time::timeout,
 };
 use tokio_rustls::TlsAcceptor;
 use tokio_util::{codec::Framed, either::Either, sync::CancellationToken};
 use tracing::{debug, error, info, trace, warn};
-use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
+use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
 
 use crate::{
     sql_state::SqlState,
+    utils::CountedTcpStream,
     vtab::{
         pg_class::PgClassTable,
         pg_database::{PgDatabase, PgDatabaseTable},
@@ -149,26 +150,32 @@ impl StmtTag {
         matches!(self, StmtTag::Select | StmtTag::InsertAsSelect)
     }
     pub fn tag(&self, rows: Option<usize>) -> Tag {
-        match self {
-            StmtTag::Select => Tag::new_for_execution("SELECT", rows),
-            StmtTag::InsertAsSelect | StmtTag::Insert => Tag::new_for_execution("INSERT", rows),
-            StmtTag::Update => Tag::new_for_execution("UPDATE", rows),
-            StmtTag::Delete => Tag::new_for_execution("DELETE", rows),
-            StmtTag::Alter => Tag::new_for_execution("ALTER", rows),
-            StmtTag::Analyze => Tag::new_for_execution("ANALYZE", rows),
-            StmtTag::Attach => Tag::new_for_execution("ATTACH", rows),
-            StmtTag::Begin => Tag::new_for_execution("BEGIN", rows),
-            StmtTag::Commit => Tag::new_for_execution("COMMIT", rows),
-            StmtTag::Create => Tag::new_for_execution("CREATE", rows),
-            StmtTag::Detach => Tag::new_for_execution("DETACH", rows),
-            StmtTag::Drop => Tag::new_for_execution("DROP", rows),
-            StmtTag::Pragma => Tag::new_for_execution("PRAGMA", rows),
-            StmtTag::Reindex => Tag::new_for_execution("REINDEX", rows),
-            StmtTag::Release => Tag::new_for_execution("RELEASE", rows),
-            StmtTag::Rollback => Tag::new_for_execution("ROLLBACK", rows),
-            StmtTag::Savepoint => Tag::new_for_execution("SAVEPOINT", rows),
-            StmtTag::Vacuum => Tag::new_for_execution("VACUUM", rows),
-            StmtTag::Other => Tag::new_for_execution("OK", rows),
+        let tag = match self {
+            StmtTag::Select => Tag::new("SELECT"),
+            StmtTag::InsertAsSelect | StmtTag::Insert => Tag::new("INSERT"),
+            StmtTag::Update => Tag::new("UPDATE"),
+            StmtTag::Delete => Tag::new("DELETE"),
+            StmtTag::Alter => Tag::new("ALTER"),
+            StmtTag::Analyze => Tag::new("ANALYZE"),
+            StmtTag::Attach => Tag::new("ATTACH"),
+            StmtTag::Begin => Tag::new("BEGIN"),
+            StmtTag::Commit => Tag::new("COMMIT"),
+            StmtTag::Create => Tag::new("CREATE"),
+            StmtTag::Detach => Tag::new("DETACH"),
+            StmtTag::Drop => Tag::new("DROP"),
+            StmtTag::Pragma => Tag::new("PRAGMA"),
+            StmtTag::Reindex => Tag::new("REINDEX"),
+            StmtTag::Release => Tag::new("RELEASE"),
+            StmtTag::Rollback => Tag::new("ROLLBACK"),
+            StmtTag::Savepoint => Tag::new("SAVEPOINT"),
+            StmtTag::Vacuum => Tag::new("VACUUM"),
+            StmtTag::Other => Tag::new("OK"),
+        };
+
+        if let Some(r) = rows {
+            tag.with_rows(r)
+        } else {
+            tag
         }
     }
 }
@@ -179,7 +186,7 @@ enum Prepared {
         sql: String,
         param_types: Vec<Type>,
         fields: Vec<FieldInfo>,
-        cmd: ParsedCmd,
+        cmd: Box<ParsedCmd>,
     },
 }
 
@@ -191,7 +198,7 @@ enum Portal<'a> {
         stmt_name: CompactString,
         stmt: Statement<'a>,
         result_formats: Vec<FieldFormat>,
-        cmd: ParsedCmd,
+        cmd: Box<ParsedCmd>,
     },
 }
 
@@ -204,6 +211,7 @@ impl<'a> Portal<'a> {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum ParsedCmd {
     Sqlite(Cmd),
     Postgres(PgStatement),
@@ -239,7 +247,7 @@ impl ParsedCmd {
     }
 
     pub fn is_set(&self) -> bool {
-        matches!(self, ParsedCmd::Postgres(PgStatement::SetVariable { .. }))
+        matches!(self, ParsedCmd::Postgres(PgStatement::Set { .. }))
     }
 
     fn tag(&self) -> StmtTag {
@@ -426,35 +434,6 @@ enum OpenTxKind {
     Explicit,
 }
 
-async fn peek_for_sslrequest(tcp_socket: &mut TcpStream) -> std::io::Result<bool> {
-    let mut want_ssl = false;
-    let mut buf = [0u8; SslRequest::BODY_SIZE];
-    let mut buf = ReadBuf::new(&mut buf);
-    loop {
-        let size = poll_fn(|cx| tcp_socket.poll_peek(cx, &mut buf)).await?;
-        if size == 0 {
-            // the tcp_stream has ended
-            return Ok(false);
-        }
-        if size == SslRequest::BODY_SIZE {
-            let mut buf_ref = buf.filled();
-            // skip first 4 bytes
-            buf_ref.get_i32();
-            if buf_ref.get_i32() == SslRequest::BODY_MAGIC_NUMBER {
-                // the socket is sending sslrequest, read the first 8 bytes
-                // skip first 8 bytes
-                tcp_socket
-                    .read_exact(&mut [0u8; SslRequest::BODY_SIZE])
-                    .await?;
-                // ssl configured
-                want_ssl = true;
-            }
-
-            return Ok(want_ssl);
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum PgStartError {
     #[error(transparent)]
@@ -466,6 +445,9 @@ pub enum PgStartError {
 }
 
 async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
+    use eyre::ContextCompat as _;
+    use rustls::pki_types::pem::PemObject as _;
+
     let tls = match pg.tls {
         Some(tls) => tls,
         None => {
@@ -475,66 +457,46 @@ async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
 
     let ssl_required = tls.verify_client;
 
-    let key = tokio::fs::read(&tls.key_file).await?;
-    let key = if tls.key_file.extension().map_or(false, |x| x == "der") {
-        rustls::PrivateKey(key)
+    let key_data = tokio::fs::read(&tls.key_file).await?;
+    let key = if tls.key_file.extension() == Some("der") {
+        rustls::pki_types::PrivateKeyDer::try_from(key_data).map_err(|e| eyre::eyre!("{e}"))?
     } else {
-        let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)?;
-        match pkcs8.into_iter().next() {
-            Some(x) => rustls::PrivateKey(x),
-            None => {
-                let rsa = rustls_pemfile::rsa_private_keys(&mut &*key)?;
-                match rsa.into_iter().next() {
-                    Some(x) => rustls::PrivateKey(x),
-                    None => {
-                        eyre::bail!("no private keys found");
-                    }
-                }
-            }
-        }
+        rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_data)?
     };
 
     let certs = tokio::fs::read(&tls.cert_file).await?;
-    let certs = if tls.cert_file.extension().map_or(false, |x| x == "der") {
-        vec![rustls::Certificate(certs)]
+    let certs = if tls.cert_file.extension() == Some("der") {
+        vec![rustls::pki_types::CertificateDer::from(certs)]
     } else {
-        rustls_pemfile::certs(&mut &*certs)?
-            .into_iter()
-            .map(rustls::Certificate)
-            .collect()
+        rustls::pki_types::CertificateDer::pem_slice_iter(&certs)
+            .map(|res| res.wrap_err_with(|| format!("failed to read certs from {}", tls.key_file)))
+            .collect::<eyre::Result<Vec<_>>>()?
     };
 
-    let server_crypto = ServerConfig::builder().with_safe_defaults();
+    let server_crypto = ServerConfig::builder();
 
     let server_crypto = if ssl_required {
-        let ca_file = match &tls.ca_file {
-            None => {
-                eyre::bail!(
-                    "ca_file required in tls config for server client cert auth verification"
-                );
-            }
-            Some(ca_file) => ca_file,
-        };
+        let ca_file = tls
+            .ca_file
+            .as_ref()
+            .context("ca_file required in tls config for server client cert auth verification")?;
 
         let ca_certs = tokio::fs::read(&ca_file).await?;
-        let ca_certs = if ca_file.extension().map_or(false, |x| x == "der") {
-            vec![rustls::Certificate(ca_certs)]
-        } else {
-            rustls_pemfile::certs(&mut &*ca_certs)?
-                .into_iter()
-                .map(rustls::Certificate)
-                .collect()
-        };
 
         let mut root_store = rustls::RootCertStore::empty();
 
-        for cert in ca_certs {
-            root_store.add(&cert)?;
+        if ca_file.extension() == Some("der") {
+            root_store.add(rustls::pki_types::CertificateDer::from_slice(&ca_certs))?;
+        } else {
+            for cert in rustls::pki_types::CertificateDer::pem_slice_iter(&ca_certs) {
+                root_store
+                    .add(cert.wrap_err_with(|| format!("failed to read certs from {ca_file}"))?)?;
+            }
         }
 
-        server_crypto.with_client_cert_verifier(Arc::new(
-            rustls::server::AllowAnyAuthenticatedClient::new(root_store),
-        ))
+        server_crypto.with_client_cert_verifier(
+            rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store)).build()?,
+        )
     } else {
         server_crypto.with_no_client_auth()
     };
@@ -546,71 +508,85 @@ async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
 pub async fn start(
     agent: Agent,
     pg: PgConfig,
-    mut tripwire: Tripwire,
+    tripwire: Tripwire,
 ) -> Result<PgServer, PgStartError> {
+    let readonly = pg.readonly;
     let server = TcpListener::bind(pg.bind_addr).await?;
     let (tls_acceptor, ssl_required) = setup_tls(pg).await?;
     let local_addr = server.local_addr()?;
+    let conn_gauge = persistent_gauge!("corro.api.active.streams",
+    "source" => "postgres",
+    "protocol" => "pg",
+    "readonly" => readonly.to_string(),
+    );
 
-    tokio::spawn(async move {
+    spawn_counted(async move {
+        let mut conn_tripwire = tripwire.clone();
         loop {
-            let (mut conn, remote_addr) = match server.accept().preemptible(&mut tripwire).await {
-                Outcome::Completed(res) => res?,
-                Outcome::Preempted(_) => break,
-            };
+            let (tcp_conn, remote_addr) =
+                match server.accept().preemptible(&mut conn_tripwire).await {
+                    Outcome::Completed(res) => res?,
+                    Outcome::Preempted(_) => break,
+                };
+            let conn = CountedTcpStream::wrap(tcp_conn, conn_gauge.clone());
             let tls_acceptor = tls_acceptor.clone();
             debug!("Accepted a PostgreSQL connection (from: {remote_addr})");
 
+            counter!("corro.api.connection.count", "protocol" => "pg", "readonly" => readonly.to_string()).increment(1);
+
             let agent = agent.clone();
+            let tripwire = tripwire.clone();
+            // Don't use spawn_counted here
+            // Until the connection gets fully established we don't need to gracefully close it
             tokio::spawn(async move {
-                conn.set_nodelay(true)?;
+                conn.stream.set_nodelay(true)?;
                 {
-                    let sock = SockRef::from(&conn);
+                    let sock = SockRef::from(&conn.stream);
                     let ka = TcpKeepalive::new()
                         .with_time(Duration::from_secs(10))
                         .with_interval(Duration::from_secs(10))
                         .with_retries(4);
                     sock.set_tcp_keepalive(&ka)?;
                 }
-                let is_sslrequest = peek_for_sslrequest(&mut conn).await?;
 
-                // reject non-ssl connections if ssl is required (client cert auth)
-                if ssl_required && !is_sslrequest {
-                    debug!("rejecting non-ssl connection");
+                let mut tcp_socket = Framed::new(
+                    tokio::io::BufStream::new(conn),
+                    PgWireMessageServerCodec::new(codec::Client::new(local_addr, false)),
+                );
+
+                let negotiation =
+                    ssl::negotiate_ssl(&mut tcp_socket, tls_acceptor.is_some()).await?;
+
+                let (mut framed, secured) = if matches!(negotiation, ssl::SslNegotiationType::None)
+                {
+                    if ssl_required {
+                        debug!("rejecting non-ssl connection");
+                        return Ok(());
+                    }
+
+                    (Either::Left(tcp_socket), false)
+                } else if let Some(tls) = tls_acceptor {
+                    let tls_socket = tls.accept(tcp_socket.into_inner()).await?;
+
+                    if matches!(negotiation, ssl::SslNegotiationType::Direct) {
+                        ssl::check_alpn_for_direct_ssl(&tls_socket)?;
+                    }
+
+                    let framed = Framed::new(
+                        tokio::io::BufStream::new(tls_socket),
+                        PgWireMessageServerCodec::new(codec::Client::new(local_addr, true)),
+                    );
+
+                    (Either::Right(framed), true)
+                } else {
+                    trace!("received SSL connection attempt without a TLS acceptor configured");
                     return Ok(());
-                }
-
-                let (mut framed, secured) = match (tls_acceptor, is_sslrequest) {
-                    (Some(tls_acceptor), true) => {
-                        conn.write_all(b"S").await?;
-                        let tls_conn = tls_acceptor.accept(conn).await?;
-                        (
-                            Framed::new(
-                                Either::Left(tls_conn),
-                                PgWireMessageServerCodec::new(ClientInfoHolder::new(
-                                    local_addr, true,
-                                )),
-                            ),
-                            true,
-                        )
-                    }
-                    (_, is_sslreq) => {
-                        if is_sslreq {
-                            conn.write_all(b"N").await?;
-                        }
-                        (
-                            Framed::new(
-                                Either::Right(conn),
-                                PgWireMessageServerCodec::new(ClientInfoHolder::new(
-                                    local_addr, false,
-                                )),
-                            ),
-                            false,
-                        )
-                    }
                 };
 
                 trace!("SSL ? {secured}");
+
+                use crate::codec::SetState;
+                framed.set_state(pgwire::api::PgWireConnectionState::AwaitingStartup);
 
                 let msg = match framed.next().await {
                     Some(msg) => msg?,
@@ -655,7 +631,7 @@ pub async fn start(
 
                 framed
                     .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
-                        READY_STATUS_IDLE,
+                        TransactionStatus::Idle,
                     )))
                     .await?;
 
@@ -670,42 +646,56 @@ pub async fn start(
 
                 let cancel = CancellationToken::new();
 
-                tokio::spawn({
-                    let back_tx = back_tx.clone();
+                // If we're shutting down corrosion, both frontend and backend tasks will finish
+                let mut frontend_task = spawn_counted({
+                    // Use a weak sender here; it should NOT hold the backend channel (and half-connection) open
+                    let back_tx = back_tx.clone().downgrade();
                     let cancel = cancel.clone();
+                    let mut tripwire = tripwire.clone();
                     async move {
                         // cancel stuff if this loop breaks
                         let _drop_guard = cancel.drop_guard();
 
-                        while let Some(decode_res) = stream.next().await {
-                            let msg = match decode_res {
-                                Ok(msg) => msg,
-                                Err(PgWireError::IoError(io_error)) => {
-                                    debug!("postgres io error: {io_error}");
-                                    break;
-                                }
-                                Err(e) => {
-                                    warn!("could not receive pg frontend message: {e}");
-                                    // attempt to send this...
-                                    _ = back_tx.try_send(
-                                        (
-                                            PgWireBackendMessage::ErrorResponse(
-                                                ErrorInfo::new(
-                                                    "FATAL".to_owned(),
-                                                    "XX000".to_owned(),
-                                                    e.to_string(),
+                        match async move {
+                            while let Some(decode_res) = stream.next().await {
+                                let msg = match decode_res {
+                                    Ok(msg) => msg,
+                                    Err(PgWireError::IoError(io_error)) => {
+                                        debug!("postgres io error: {io_error}");
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        warn!("could not receive pg frontend message: {e}");
+                                        // attempt to send this...
+                                        if let Some(back_tx) = back_tx.upgrade() {
+                                            _ = back_tx.try_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "FATAL".to_owned(),
+                                                            "XX000".to_owned(),
+                                                            e.to_string(),
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    true,
                                                 )
-                                                .into(),
-                                            ),
-                                            true,
-                                        )
-                                            .into(),
-                                    );
-                                    break;
-                                }
-                            };
+                                                    .into(),
+                                            );
+                                        }
+                                        break;
+                                    }
+                                };
 
-                            front_tx.send(msg).await?;
+                                front_tx.send(msg).await?;
+                            }
+                            Ok::<_, BoxError>(())
+                        }
+                        .preemptible(&mut tripwire)
+                        .await
+                        {
+                            Outcome::Completed(res) => res?,
+                            Outcome::Preempted(_) => {}
                         }
                         debug!("frontend stream is done");
 
@@ -713,29 +703,67 @@ pub async fn start(
                     }
                 });
 
-                tokio::spawn({
+                let mut backend_task = spawn_counted({
                     let cancel = cancel.clone();
+                    let mut tripwire = tripwire.clone();
                     async move {
                         let _drop_guard = cancel.drop_guard();
-                        while let Some(back) = back_rx.recv().await {
-                            match back {
-                                BackendResponse::Message { message, flush } => {
-                                    if let PgWireBackendMessage::ErrorResponse(e) = &message {
-                                        warn!("sending: {e:?}");
-                                    } else {
-                                        debug!("sending: {message:?}");
+                        match async {
+                            while let Some(back) = back_rx.recv().await {
+                                match back {
+                                    BackendResponse::Message { message, flush } => {
+                                        if let PgWireBackendMessage::ErrorResponse(e) = &message {
+                                            warn!("sending: {e:?}");
+                                        } else {
+                                            debug!("sending: {message:?}");
+                                        }
+                                        sink.feed(message).await?;
+                                        if flush {
+                                            sink.flush().await?;
+                                        }
                                     }
-                                    sink.feed(message).await?;
-                                    if flush {
+                                    BackendResponse::Flush => {
                                         sink.flush().await?;
                                     }
                                 }
-                                BackendResponse::Flush => {
-                                    sink.flush().await?;
-                                }
                             }
+                            Ok::<_, std::io::Error>(())
                         }
-                        debug!("backend stream is done");
+                        .preemptible(&mut tripwire)
+                        .await
+                        {
+                            Outcome::Completed(res) => res?,
+                            Outcome::Preempted(_) => {}
+                        }
+                        if tripwire.is_shutting_down() {
+                            debug!("Closing connection due to corrosion shutdown");
+                            // Give 1s for graceful shutdown of the connection
+                            timeout(Duration::from_millis(1000), async move {
+                                let _ = sink
+                                    .feed(PgWireBackendMessage::ErrorResponse(
+                                        ErrorInfo::new(
+                                            "ERROR".to_owned(),
+                                            sql_state::SqlState::ADMIN_SHUTDOWN.code().into(),
+                                            "Corrosion is shutting down".into(),
+                                        )
+                                        .into(),
+                                    ))
+                                    .await;
+                                let _ = sink.flush().await;
+                                let _ = sink.close().await;
+                            })
+                            .await?;
+                        } else {
+                            debug!("Closing connection due to client disconnection");
+                            // If we get here, we know that `back_rx` has been fully drained.
+                            // Close the sink, this calls shutdown() on the underlying TCP socket
+                            // If the other side behaves correctly, the frontend task will eventually receive an EOF
+                            // and will also complete; by that point we know all messages have been sent successfully over TCP.
+                            // However, if this is not handled correctly we time out later.
+                            //
+                            // If we are shutting down when the client disconnects, we just exit. Don't need to timeout here
+                            let _ = sink.close().preemptible(&mut tripwire).await;
+                        }
                         Ok::<_, std::io::Error>(())
                     }
                 });
@@ -743,7 +771,11 @@ pub async fn start(
                 let res = tokio::task::spawn_blocking({
                     let back_tx = back_tx.clone();
                     move || {
-                        let conn = agent.pool().client_dedicated().unwrap();
+                        let conn = if readonly {
+                            agent.pool().client_dedicated_readonly().unwrap()
+                        } else {
+                            agent.pool().client_dedicated().unwrap()
+                        };
                         trace!("opened connection");
 
                         let int_handle = conn.get_interrupt_handle();
@@ -870,8 +902,8 @@ pub async fn start(
                                     continue;
                                 }
                                 PgWireFrontendMessage::Parse(parse) => {
-                                    let name: &str = parse.name().as_deref().unwrap_or("");
-                                    let mut cmds = match parse_query(parse.query()) {
+                                    let name: &str = parse.name.as_deref().unwrap_or_default();
+                                    let mut cmds = match parse_query(&parse.query) {
                                         Ok(cmds) => cmds,
                                         Err(e) => {
                                             back_tx.blocking_send(
@@ -922,7 +954,7 @@ pub async fn start(
 
                                             trace!("parsed cmd: {parsed_cmd:#?}");
 
-                                            let prepped = match session.conn.prepare(parse.query()) {
+                                            let prepped = match session.conn.prepare(&parse.query) {
                                                 Ok(prepped) => prepped,
                                                 Err(e) => {
                                                     back_tx.blocking_send(
@@ -945,20 +977,35 @@ pub async fn start(
                                             };
 
                                             let mut param_types: Vec<Type> = parse
-                                                .type_oids()
+                                                .type_oids
                                                 .iter()
                                                 .filter_map(|oid| Type::from_oid(*oid))
                                                 .collect();
 
                                             debug!("params types {param_types:?}");
+                                            debug!("prepped parameter count: {}", prepped.parameter_count());
 
                                             if param_types.len() != prepped.parameter_count() {
-                                                param_types = parameter_types(&schema, &parsed_cmd)
-                                                    .params
+                                                let extracted_types = parameter_types(&schema, &parsed_cmd);
+
+                                                if extracted_types.is_err() {
+                                                        let e = extracted_types.unwrap_err();
+                                                        back_tx.blocking_send(BackendResponse::Message {
+                                                            message: e.into(),
+                                                            flush: true,
+                                                        })?;
+                                                        discard_until_sync = true;
+                                                        continue;
+                                                    }
+                                                param_types = extracted_types.unwrap().params
                                                     .into_iter()
                                                     .map(|param| {
                                                         trace!("got param: {param:?}");
                                                         match (param.sqlite_type, param.source) {
+                                                            (SqliteType::Null, Some("TEXT[]")) => Type::TEXT_ARRAY,
+                                                            (SqliteType::Null, Some("INT[]")) => Type::INT8_ARRAY,
+                                                            (SqliteType::Null, Some("REAL[]")) => Type::FLOAT8_ARRAY,
+                                                            (SqliteType::Null, Some("BLOB[]")) => Type::BYTEA_ARRAY,
                                                             (SqliteType::Null, _) => unreachable!(),
                                                             (SqliteType::Text, src) => match src {
                                                                 Some("JSON") => Type::JSON,
@@ -1008,10 +1055,10 @@ pub async fn start(
                                             prepared.insert(
                                                 name.into(),
                                                 Prepared::NonEmpty {
-                                                    sql: parse.query().clone(),
+                                                    sql: parse.query.clone(),
                                                     param_types,
                                                     fields,
-                                                    cmd: parsed_cmd,
+                                                    cmd: Box::new(parsed_cmd),
                                                 },
                                             );
                                         }
@@ -1028,8 +1075,8 @@ pub async fn start(
                                     )?;
                                 }
                                 PgWireFrontendMessage::Describe(desc) => {
-                                    let name = desc.name().as_deref().unwrap_or("");
-                                    match desc.target_type() {
+                                    let name = desc.name.as_deref().unwrap_or_default();
+                                    match desc.target_type {
                                         // statement
                                         b'S' => match prepared.get(name) {
                                             None => {
@@ -1188,12 +1235,12 @@ pub async fn start(
                                 }
                                 PgWireFrontendMessage::Bind(bind) => {
                                     let portal_name = bind
-                                        .portal_name()
+                                        .portal_name
                                         .as_deref()
                                         .map(CompactString::from)
                                         .unwrap_or_default();
 
-                                    let stmt_name = bind.statement_name().as_deref().unwrap_or("");
+                                    let stmt_name = bind.statement_name.as_deref().unwrap_or_default();
 
                                     match prepared.get(stmt_name) {
                                         None => {
@@ -1252,14 +1299,14 @@ pub async fn start(
 
                                             trace!(
                                                 "bind params count: {}, statement params count: {}",
-                                                bind.parameters().len(),
+                                                bind.parameters.len(),
                                                 prepped.parameter_count()
                                             );
 
                                             debug!("bind param types: {param_types:?}");
 
                                             let mut format_codes = match bind
-                                            .parameter_format_codes()
+                                            .parameter_format_codes
                                             .iter()
                                             .map(|code| {
                                                 Ok(match *code {
@@ -1293,14 +1340,14 @@ pub async fn start(
                                             if format_codes.is_empty() {
                                                 // no format codes? default to text
                                                 format_codes =
-                                                    vec![FormatCode::Text; bind.parameters().len()];
+                                                    vec![FormatCode::Text; bind.parameters.len()];
                                             } else if format_codes.len() == 1 {
                                                 // single code means we should use it for all others
                                                 format_codes =
-                                                    vec![format_codes[0]; bind.parameters().len()];
+                                                    vec![format_codes[0]; bind.parameters.len()];
                                             }
 
-                                            for (i, param) in bind.parameters().iter().enumerate() {
+                                            for (i, param) in bind.parameters.iter().enumerate() {
                                                 let idx = i + 1;
                                                 let b = match param {
                                                     None => {
@@ -1485,22 +1532,57 @@ pub async fn start(
                                                                 prepped
                                                                     .raw_bind_parameter(idx, dt)?;
                                                             }
-
-                                                            // t @ &Type::TIMESTAMP => {
-                                                            //     let value: time::OffsetDateTime =
-                                                            //         from_type_and_format(
-                                                            //             t,
-                                                            //             b,
-                                                            //             format_code,
-                                                            //         )?;
-
-                                                            //     trace!("binding idx {idx} w/ value: {value}");
-                                                            //     prepped
-                                                            //         .raw_bind_parameter(idx, value)?;
-                                                            // }
-                                                            t => {
-                                                                warn!("unsupported type: {t:?}");
-                                                                back_tx.blocking_send(
+                                                            t @ &Type::INT8_ARRAY => {
+                                                                let value: Vec<i64> =
+                                                                    from_array_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ array value: {value:?}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, Rc::new(value.into_iter().map(|v| v.into()).collect::<Vec<rusqlite::types::Value>>()),
+                                                                )?;
+                                                            }
+                                                            t @ &Type::TEXT_ARRAY => {
+                                                                let value: Vec<String> =
+                                                                    from_array_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ array value: {value:?}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, Rc::new(value.into_iter().map(|v| v.into()).collect::<Vec<rusqlite::types::Value>>()),
+                                                                )?;
+                                                            }
+                                                            t @ &Type::BYTEA_ARRAY => {
+                                                                let value: Vec<Vec<u8>> =
+                                                                    from_array_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ array value: {value:?}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, Rc::new(value.into_iter().map(|v| v.into()).collect::<Vec<rusqlite::types::Value>>()),
+                                                                )?;
+                                                            }
+                                                            t @ &Type::FLOAT8_ARRAY => {
+                                                                let value: Vec<f64> =
+                                                                    from_array_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ array value: {value:?}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, Rc::new(value.into_iter().map(|v| v.into()).collect::<Vec<rusqlite::types::Value>>()),
+                                                                )?;
+                                                            }
+                                                        t => {
+                                                            warn!("unsupported type: {t:?}");
+                                                            back_tx.blocking_send(
                                                                 (
                                                                     PgWireBackendMessage::ErrorResponse(
                                                                         ErrorInfo::new(
@@ -1531,7 +1613,7 @@ pub async fn start(
                                                     stmt_name: stmt_name.into(),
                                                     stmt: prepped,
                                                     result_formats: bind
-                                                        .result_column_format_codes()
+                                                        .result_column_format_codes
                                                         .iter()
                                                         .copied()
                                                         .map(FieldFormat::from)
@@ -1557,7 +1639,7 @@ pub async fn start(
                                     discard_until_sync = false;
                                 }
                                 PgWireFrontendMessage::Execute(execute) => {
-                                    let name = execute.name().as_deref().unwrap_or("");
+                                    let name = execute.name.as_deref().unwrap_or_default();
                                     let (prepped, result_formats, cmd) = match portals.get_mut(name)
                                     {
                                         Some(Portal::Empty { .. }) => {
@@ -1601,11 +1683,10 @@ pub async fn start(
 
                                     trace!("non-empty portal!");
 
-                                    let max_rows = *execute.max_rows();
-                                    let max_rows = if max_rows == 0 {
+                                    let max_rows = if execute.max_rows <= 0 {
                                         usize::MAX
                                     } else {
-                                        max_rows as usize
+                                        execute.max_rows as usize
                                     };
 
                                     if let Err(e) = session.handle_execute(
@@ -1633,7 +1714,7 @@ pub async fn start(
                                     }
                                 }
                                 PgWireFrontendMessage::Query(query) => {
-                                    let parsed_query = match parse_query(query.query()) {
+                                    let parsed_query = match parse_query(&query.query) {
                                         Ok(q) => q,
                                         Err(e) => {
                                             back_tx.blocking_send(
@@ -1749,8 +1830,8 @@ pub async fn start(
                                     continue;
                                 }
                                 PgWireFrontendMessage::Close(close) => {
-                                    let name = close.name().as_deref().unwrap_or("");
-                                    match close.target_type() {
+                                    let name = close.name.as_deref().unwrap_or_default();
+                                    match close.target_type {
                                         // statement
                                         b'S' => {
                                             if prepared.remove(name).is_some() {
@@ -1857,6 +1938,48 @@ pub async fn start(
                                     )?;
                                     continue;
                                 }
+                                PgWireFrontendMessage::CancelRequest(_) => {
+                                    // cancel.cancel(); ?
+                                    back_tx.blocking_send(
+                                        (
+                                            PgWireBackendMessage::ErrorResponse(
+                                                ErrorInfo::new(
+                                                    "ERROR".into(),
+                                                    "XX000".to_owned(),
+                                                    "Cancel is not implemented".into(),
+                                                )
+                                                .into(),
+                                            ),
+                                            true,
+                                        )
+                                            .into(),
+                                    )?;
+                                    continue;
+                                }
+                                PgWireFrontendMessage::GssEncRequest(_) => {
+                                    back_tx.blocking_send(
+                                        (
+                                            PgWireBackendMessage::GssEncResponse(pgwire::messages::response::GssEncResponse::Refuse), false
+                                        ).into())?;
+                                    continue;
+                                }
+                                PgWireFrontendMessage::SslRequest(_) => {
+                                    back_tx.blocking_send(
+                                        (
+                                            PgWireBackendMessage::ErrorResponse(
+                                                ErrorInfo::new(
+                                                    "ERROR".into(),
+                                                    "XX000".to_owned(),
+                                                    "SslRequest is not implemented".into(),
+                                                )
+                                                .into(),
+                                            ),
+                                            true,
+                                        )
+                                            .into(),
+                                    )?;
+                                    continue;
+                                }
                             }
                         }
 
@@ -1904,6 +2027,31 @@ pub async fn start(
                             )
                             .await;
                     }
+                }
+
+                // The message-handling loop has completed, make sure we also abort the tasks
+                // handling the TCP connection
+                // Firstly we attempt a graceful shutdown -- dropping back_tx will cause
+                // backend_task to complete once it writes all content to the TCP socket
+                // Then, frontend_task will eventually receive an EOF if clients behave properly
+                // Note that this should be the only reference of back_tx at this point:
+                // the one in frontend_task is weak, and the one cloned into the message-handling
+                // thread should have been dropped.
+                assert_eq!(back_tx.strong_count(), 1);
+                drop(back_tx);
+
+                // Now we wait for both front and back to complete; if however frontend_task never
+                // receives an EOF, instead of relying on half-open timeout we just abort both tasks
+                // after 1 minute.
+                match async { tokio::join!(&mut frontend_task, &mut backend_task) }
+                    .with_timeout(Duration::from_secs(60))
+                    .await
+                {
+                    Outcome::Preempted(_) => {
+                        frontend_task.abort();
+                        backend_task.abort();
+                    }
+                    Outcome::Completed(_) => {}
                 }
 
                 Ok::<_, BoxError>(())
@@ -2015,6 +2163,9 @@ impl<'conn> Session<'conn> {
                 trace!("query statement writes, acquiring permit...");
                 self.tx_state
                     .set_write_permit(self.agent.write_permit_blocking()?);
+
+                counter!("corro.acquired.write.permit.count", "protocol" => "pg").increment(1);
+                self.set_ts()?;
             }
 
             let mut rows = prepped.raw_query();
@@ -2130,6 +2281,8 @@ impl<'conn> Session<'conn> {
                 trace!("statement writes, acquiring permit...");
                 self.tx_state
                     .set_write_permit(self.agent.write_permit_blocking()?);
+
+                self.set_ts()?;
             }
             let mut rows = prepped.raw_query();
             loop {
@@ -2165,7 +2318,7 @@ impl<'conn> Session<'conn> {
                 let mut encoder = DataRowEncoder::new(schema.clone());
                 for (idx, field) in schema.iter().enumerate() {
                     trace!("processing field: {field:?}");
-                    let format = *field.format();
+                    let format = field.format();
                     match field.datatype() {
                         &Type::ANY => {
                             let data = row.get_ref_unwrap(idx);
@@ -2253,7 +2406,9 @@ impl<'conn> Session<'conn> {
                                 .unwrap();
                         }
                         _ => {
-                            return Err(UnsupportedSqliteToPostgresType(field.name().clone()).into())
+                            return Err(
+                                UnsupportedSqliteToPostgresType(field.name().to_owned()).into()
+                            )
                         }
                     }
                 }
@@ -2312,7 +2467,6 @@ impl<'conn> Session<'conn> {
             })?;
 
         if let Some(InsertChangesInfo {
-            version,
             db_version,
             last_seq,
             ts,
@@ -2325,10 +2479,19 @@ impl<'conn> Session<'conn> {
 
             let agent = self.agent.clone();
 
-            spawn_counted(async move {
-                broadcast_changes(agent, db_version, last_seq, version, ts).await
-            });
+            spawn_counted(async move { broadcast_changes(agent, db_version, last_seq, ts).await });
         }
+
+        Ok(())
+    }
+
+    fn set_ts(&self) -> Result<(), rusqlite::Error> {
+        let ts = Timestamp::from(self.agent.clock().new_timestamp());
+
+        let _ = self
+            .conn
+            .prepare_cached("SELECT crsql_set_ts(?)")?
+            .query_row([&ts], |row| row.get::<_, String>(0))?;
 
         Ok(())
     }
@@ -2364,15 +2527,15 @@ fn send_ready(
             session.handle_commit()?;
         }
 
-        READY_STATUS_IDLE
+        TransactionStatus::Idle
     } else if session.tx_state.is_explicit() {
         if discard_until_sync {
-            READY_STATUS_FAILED_TRANSACTION_BLOCK
+            TransactionStatus::Error
         } else {
-            READY_STATUS_TRANSACTION_BLOCK
+            TransactionStatus::Transaction
         }
     } else {
-        READY_STATUS_IDLE
+        TransactionStatus::Idle
     };
 
     back_tx.blocking_send(
@@ -2392,6 +2555,8 @@ enum QueryError {
     Rusqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Unsupported(#[from] UnsupportedSqliteToPostgresType),
+    #[error(transparent)]
+    UntypedUnnest(#[from] UntypedUnnestParameter),
     #[error("statement is not parsable as SQLite-flavored SQL")]
     NotSqlite,
     #[error(transparent)]
@@ -2427,6 +2592,7 @@ impl TryFrom<QueryError> for PgWireBackendMessage {
                 _ => ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into(),
             },
             QueryError::Unsupported(e) => e.into(),
+            QueryError::UntypedUnnest(e) => e.into(),
             e @ QueryError::NotSqlite => {
                 ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
             }
@@ -2481,6 +2647,17 @@ fn from_type_and_format<'a, E, T: FromSql<'a> + FromStr<Err = E>>(
     })
 }
 
+fn from_array_type_and_format<'a, T: FromSql<'a>>(
+    t: &Type,
+    b: &'a [u8],
+    format_code: FormatCode,
+) -> Result<Vec<T>, ToParamError<String>> {
+    Ok(match format_code {
+        FormatCode::Text => panic!("Impossible - arrays are only sent in binary format"),
+        FormatCode::Binary => Vec::<T>::from_sql(t, b).map_err(ToParamError::FromSql)?,
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("Unsupported data type: {0}")]
 struct UnsupportedSqliteToPostgresType(String);
@@ -2494,6 +2671,22 @@ impl From<UnsupportedSqliteToPostgresType> for PgWireBackendMessage {
 impl From<UnsupportedSqliteToPostgresType> for ErrorResponse {
     fn from(value: UnsupportedSqliteToPostgresType) -> Self {
         ErrorInfo::new("ERROR".to_owned(), "42846".to_owned(), value.to_string()).into()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Untyped array argument for unnest(), please use CAST($N AS T) where T is one of: TEXT[] BLOB[] INT[] INTEGER[] BIGINT[] REAL[] FLOAT[] DOUBLE[]")]
+struct UntypedUnnestParameter;
+
+impl From<UntypedUnnestParameter> for PgWireBackendMessage {
+    fn from(value: UntypedUnnestParameter) -> Self {
+        PgWireBackendMessage::ErrorResponse(value.into())
+    }
+}
+
+impl From<UntypedUnnestParameter> for ErrorResponse {
+    fn from(value: UntypedUnnestParameter) -> Self {
+        ErrorInfo::new("ERROR".to_owned(), "42804".to_owned(), value.to_string()).into()
     }
 }
 
@@ -2513,34 +2706,39 @@ fn name_to_type(name: &str) -> Result<Type, UnsupportedSqliteToPostgresType> {
     })
 }
 
-fn compute_schema(conn: &Connection) -> Result<Schema, SchemaError> {
-    let mut dump = String::new();
+fn compute_schema(conn: &Connection) -> Result<Schema, Box<SchemaError>> {
+    fn dump_sql(conn: &Connection) -> Result<String, rusqlite::Error> {
+        let mut dump = String::new();
 
-    let tables: HashMap<String, String> = conn
-        .prepare(r#"SELECT name, sql FROM sqlite_schema WHERE type = "table" AND name IS NOT NULL AND sql IS NOT NULL ORDER BY tbl_name"#)?
-        .query_map((), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+        let tables: HashMap<String, String> = conn
+            .prepare(r#"SELECT name, sql FROM sqlite_schema WHERE type = "table" AND name IS NOT NULL AND sql IS NOT NULL ORDER BY tbl_name"#)?
+            .query_map((), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
 
-    for sql in tables.values() {
-        dump.push_str(sql.as_str());
-        dump.push(';');
+        for sql in tables.values() {
+            dump.push_str(sql.as_str());
+            dump.push(';');
+        }
+
+        let indexes: HashMap<String, String> = conn
+            .prepare(r#"SELECT name, sql FROM sqlite_schema WHERE type = "index" AND name IS NOT NULL AND sql IS NOT NULL ORDER BY tbl_name"#)?
+            .query_map((), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+        for sql in indexes.values() {
+            dump.push_str(sql.as_str());
+            dump.push(';');
+        }
+
+        Ok(dump)
     }
 
-    let indexes: HashMap<String, String> = conn
-        .prepare(r#"SELECT name, sql FROM sqlite_schema WHERE type = "index" AND name IS NOT NULL AND sql IS NOT NULL ORDER BY tbl_name"#)?
-        .query_map((), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-
-    for sql in indexes.values() {
-        dump.push_str(sql.as_str());
-        dump.push(';');
-    }
-
-    parse_sql(dump.as_str())
+    let dump = dump_sql(conn).map_err(|err| Box::new(SchemaError::from(err)))?;
+    parse_sql(&dump)
 }
 
 #[derive(Debug)]
@@ -2549,7 +2747,7 @@ enum ParamKind<'a> {
     Positional,
 }
 
-fn as_param(expr: &Expr) -> Option<ParamKind> {
+fn as_param(expr: &Expr) -> Option<ParamKind<'_>> {
     if let Expr::Variable(name) = expr {
         if name.is_empty() {
             Some(ParamKind::Positional)
@@ -2582,6 +2780,7 @@ impl<'a> SqliteNameRef<'a> {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 enum SqliteName {
     Id(Id),
     Name(Name),
@@ -2589,7 +2788,7 @@ enum SqliteName {
     DoublyQualified(Name, Name, Name),
 }
 
-fn expr_to_name(expr: &Expr) -> Option<SqliteNameRef> {
+fn expr_to_name(expr: &Expr) -> Option<SqliteNameRef<'_>> {
     match expr {
         Expr::Id(id) => Some(SqliteNameRef::Id(id)),
         Expr::Name(name) => Some(SqliteNameRef::Name(name)),
@@ -2598,37 +2797,6 @@ fn expr_to_name(expr: &Expr) -> Option<SqliteNameRef> {
         _ => None,
     }
 }
-
-// determines the type of a literal type if any
-// fn literal_type(expr: &Expr) -> Option<SqliteType> {
-//     match expr {
-//         Expr::Literal(lit) => match lit {
-//             Literal::Numeric(num) => {
-//                 if num.parse::<i64>().is_ok() {
-//                     Some(SqliteType::Integer)
-//                 } else if num.parse::<f64>().is_ok() {
-//                     Some(SqliteType::Real)
-//                 } else {
-//                     // this should be unreachable...
-//                     None
-//                 }
-//             }
-//             Literal::String(_) => Some(SqliteType::Text),
-//             Literal::Blob(_) => Some(SqliteType::Blob),
-//             Literal::Keyword(keyword) => {
-//                 // TODO: figure out what this is...
-//                 warn!("got a keyword: {keyword}");
-//                 None
-//             }
-//             Literal::Null => Some(SqliteType::Null),
-//             Literal::CurrentDate | Literal::CurrentTime | Literal::CurrentTimestamp => {
-//                 // TODO: make this configurable at connection time or something
-//                 Some(SqliteType::Text)
-//             }
-//         },
-//         _ => None,
-//     }
-// }
 
 fn handle_lhs_rhs<'stmt>(
     lhs: &'stmt Expr,
@@ -2650,7 +2818,7 @@ fn extract_params<'schema, 'stmt>(
     expr: &'stmt Expr,
     tables: &HashMap<String, &'schema Table>,
     params: &mut ParamsList<'stmt, 'schema>,
-) {
+) -> Result<(), UntypedUnnestParameter> {
     match expr {
         // expr BETWEEN expr AND expr
         Expr::Between {
@@ -2703,8 +2871,8 @@ fn extract_params<'schema, 'stmt>(
                     }
                 }
             } else {
-                extract_params(schema, lhs, tables, params);
-                extract_params(schema, rhs, tables, params);
+                extract_params(schema, lhs, tables, params)?;
+                extract_params(schema, rhs, tables, params)?;
             }
         }
 
@@ -2728,7 +2896,7 @@ fn extract_params<'schema, 'stmt>(
         Expr::DoublyQualified(_, _, _) => {}
 
         // EXISTS ( select )
-        Expr::Exists(select) => handle_select(schema, select, params),
+        Expr::Exists(select) => handle_select(schema, select, params)?,
 
         // function-name ( [DISTINCT] expr, ... ) filter-clause over-clause
         Expr::FunctionCall {
@@ -2801,7 +2969,7 @@ fn extract_params<'schema, 'stmt>(
             rhs,
         } => {
             // TODO: check LHS here
-            handle_select(schema, rhs.as_ref(), params);
+            handle_select(schema, rhs.as_ref(), params)?;
         }
 
         // expr IN schema-name.table-name | schema-name.table-function ( expr, ... )
@@ -2838,7 +3006,7 @@ fn extract_params<'schema, 'stmt>(
         // ( expr, ... )
         Expr::Parenthesized(exprs) => {
             for expr in exprs.iter() {
-                extract_params(schema, expr, tables, params)
+                extract_params(schema, expr, tables, params)?
             }
         }
 
@@ -2849,7 +3017,7 @@ fn extract_params<'schema, 'stmt>(
         Expr::Raise(_, _) => {}
 
         // SELECT
-        Expr::Subquery(select) => handle_select(schema, select, params),
+        Expr::Subquery(select) => handle_select(schema, select, params)?,
 
         // NOT | ~ | - | + expr
         Expr::Unary(_, _) => {}
@@ -2857,6 +3025,7 @@ fn extract_params<'schema, 'stmt>(
         // ? | $ | :
         Expr::Variable(_) => {}
     }
+    Ok(())
 }
 
 fn rem_first_and_last(value: &str) -> &str {
@@ -2870,7 +3039,7 @@ fn handle_select<'schema, 'stmt>(
     schema: &'schema Schema,
     select: &'stmt Select,
     params: &mut ParamsList<'stmt, 'schema>,
-) {
+) -> Result<(), UntypedUnnestParameter> {
     let tables = match &select.body.select {
         OneSelect::Select {
             columns,
@@ -2881,10 +3050,10 @@ fn handle_select<'schema, 'stmt>(
             window_clause: _,
         } => {
             let tables = if let Some(from) = from {
-                let tables = handle_from(schema, from, params);
+                let tables = handle_from(schema, from, params)?;
                 if let Some(where_clause) = where_clause {
                     trace!("WHERE CLAUSE: {where_clause:?}");
-                    extract_params(schema, where_clause, &tables, params);
+                    extract_params(schema, where_clause, &tables, params)?;
                 }
                 tables
             } else {
@@ -2920,15 +3089,80 @@ fn handle_select<'schema, 'stmt>(
         }
     };
     if let Some(limit) = &select.limit {
-        handle_limit(schema, limit, &tables, params);
+        handle_limit(schema, limit, &tables, params)?;
     }
+    Ok(())
+}
+
+/// Handle parameters in table function calls like unnest()
+/// Returns an error if unnest() is called with an untyped parameter
+///
+/// TODO: Perhaps we should enable chaining let expressions in the compiler
+///       to avoid the nesting here
+fn handle_table_call_params<'schema, 'stmt>(
+    qname: &QualifiedName,
+    args: &'stmt Option<Vec<Expr>>,
+    params: &mut ParamsList<'stmt, 'schema>,
+) -> Result<(), UntypedUnnestParameter> {
+    if let Some(exprs) = args {
+        let is_unnest = qname.name.0.eq_ignore_ascii_case("UNNEST");
+
+        for expr in exprs.iter() {
+            // If not unnest, just extract params
+            // TODO: handle expressions more generally
+            if !is_unnest {
+                if let Some(kind) = as_param(expr) {
+                    params.insert(Param {
+                        kind,
+                        sqlite_type: SqliteType::Text,
+                        source: None,
+                    });
+                }
+                continue;
+            }
+
+            // For unnest we force "CAST($1 AS type[])" for parameters
+            // We can't use the ANYARRAY postgres type here as it doesn't work with client libraries
+            if let Expr::Cast {
+                expr: inner_expr,
+                type_name,
+            } = expr
+            {
+                if let Some(kind) = as_param(inner_expr) {
+                    let type_str = type_name.name.to_uppercase();
+                    let is_array_type = type_str.ends_with("[]");
+                    let base_type = type_str[..type_str.len() - 2].trim();
+                    let param_source = match base_type {
+                        "TEXT" => Some("TEXT[]"),
+                        "BLOB" => Some("BLOB[]"),
+                        "INT" | "INTEGER" | "BIGINT" => Some("INT[]"),
+                        "REAL" | "FLOAT" | "DOUBLE" => Some("REAL[]"),
+                        _ => None,
+                    };
+                    if is_array_type {
+                        if let Some(source) = param_source {
+                            params.insert(Param {
+                                kind,
+                                sqlite_type: SqliteType::Null,
+                                source: Some(source),
+                            });
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            return Err(UntypedUnnestParameter);
+        }
+    }
+    Ok(())
 }
 
 fn handle_from<'schema, 'stmt>(
     schema: &'schema Schema,
     from: &'stmt FromClause,
     params: &mut ParamsList<'stmt, 'schema>,
-) -> HashMap<String, &'schema Table> {
+) -> Result<HashMap<String, &'schema Table>, UntypedUnnestParameter> {
     let mut tables: HashMap<String, &Table> = HashMap::new();
     if let Some(select) = from.select.as_deref() {
         match select {
@@ -2950,9 +3184,11 @@ fn handle_from<'schema, 'stmt>(
                     }
                 }
             }
-            SelectTable::TableCall(_, _, _) => {}
+            SelectTable::TableCall(qname, args, _alias) => {
+                handle_table_call_params(qname, args, params)?;
+            }
             SelectTable::Select(select, _) => {
-                handle_select(schema, select, params);
+                handle_select(schema, select, params)?;
             }
             SelectTable::Sub(_, _) => {}
         }
@@ -2978,15 +3214,17 @@ fn handle_from<'schema, 'stmt>(
                         }
                     }
                 }
-                SelectTable::TableCall(_, _, _) => {}
+                SelectTable::TableCall(qname, args, _alias) => {
+                    handle_table_call_params(qname, args, params)?;
+                }
                 SelectTable::Select(select, _) => {
-                    handle_select(schema, select, params);
+                    handle_select(schema, select, params)?;
                 }
                 SelectTable::Sub(_, _) => {}
             }
         }
     }
-    tables
+    Ok(tables)
 }
 
 #[derive(Debug)]
@@ -3020,7 +3258,7 @@ fn handle_limit<'schema, 'stmt>(
     limit: &'stmt Limit,
     tables: &HashMap<String, &'schema Table>,
     params: &mut ParamsList<'stmt, 'schema>,
-) {
+) -> Result<(), UntypedUnnestParameter> {
     if let Some(kind) = as_param(&limit.expr) {
         trace!("limit was a param (variable), pushing Integer type");
         params.insert(Param {
@@ -3029,7 +3267,7 @@ fn handle_limit<'schema, 'stmt>(
             source: None,
         });
     } else {
-        extract_params(schema, &limit.expr, tables, params);
+        extract_params(schema, &limit.expr, tables, params)?;
     }
     if let Some(offset) = &limit.offset {
         if let Some(kind) = as_param(offset) {
@@ -3040,19 +3278,20 @@ fn handle_limit<'schema, 'stmt>(
                 source: None,
             });
         } else {
-            extract_params(schema, offset, tables, params);
+            extract_params(schema, offset, tables, params)?;
         }
     }
+    Ok(())
 }
 
 fn handle_with<'schema, 'stmt>(
     schema: &'schema Schema,
     with: &'stmt With,
     params: &mut ParamsList<'stmt, 'schema>,
-) -> Vec<Table> {
+) -> Result<Vec<Table>, UntypedUnnestParameter> {
     let mut tables = vec![];
     for cte in with.ctes.iter() {
-        handle_select(schema, &cte.select, params);
+        handle_select(schema, &cte.select, params)?;
         tables.push(Table {
             name: cte.tbl_name.0.clone(),
             pk: Default::default(),
@@ -3087,18 +3326,18 @@ fn handle_with<'schema, 'stmt>(
             raw: CreateTableBody::AsSelect(cte.select.clone()),
         })
     }
-    tables
+    Ok(tables)
 }
 
 fn parameter_types<'schema, 'stmt>(
     schema: &'schema Schema,
     cmd: &'stmt ParsedCmd,
-) -> ParamsList<'stmt, 'schema> {
+) -> Result<ParamsList<'stmt, 'schema>, UntypedUnnestParameter> {
     let mut params = ParamsList::default();
 
     if let ParsedCmd::Sqlite(Cmd::Stmt(stmt)) = cmd {
         match stmt {
-            Stmt::Select(select) => handle_select(schema, select, &mut params),
+            Stmt::Select(select) => handle_select(schema, select, &mut params)?,
             Stmt::Delete {
                 with,
                 tbl_name,
@@ -3108,7 +3347,7 @@ fn parameter_types<'schema, 'stmt>(
             } => {
                 if let Some(with) = with {
                     // TODO: do something w/ the accumulated tables?
-                    handle_with(schema, with, &mut params);
+                    handle_with(schema, with, &mut params)?;
                 }
 
                 let mut tables = HashMap::new();
@@ -3116,11 +3355,11 @@ fn parameter_types<'schema, 'stmt>(
                     tables.insert(tbl_name.name.0.clone(), tbl);
                 }
                 if let Some(where_clause) = where_clause {
-                    extract_params(schema, where_clause, &tables, &mut params);
+                    extract_params(schema, where_clause, &tables, &mut params)?;
                 }
 
                 if let Some(limit) = limit {
-                    handle_limit(schema, limit, &tables, &mut params);
+                    handle_limit(schema, limit, &tables, &mut params)?;
                 }
             }
             Stmt::Insert {
@@ -3134,7 +3373,7 @@ fn parameter_types<'schema, 'stmt>(
 
                 if let Some(with) = with {
                     // TODO: do something w/ the accumulated tables?
-                    handle_with(schema, with, &mut params);
+                    handle_with(schema, with, &mut params)?;
                 }
 
                 if let Some(table) = schema.tables.get(&tbl_name.name.0) {
@@ -3164,7 +3403,7 @@ fn parameter_types<'schema, 'stmt>(
                                     }
                                 }
                             } else {
-                                handle_select(schema, select, &mut params)
+                                handle_select(schema, select, &mut params)?
                             }
                         }
                         InsertBody::DefaultValues => {
@@ -3187,7 +3426,7 @@ fn parameter_types<'schema, 'stmt>(
             } => {
                 if let Some(with) = with {
                     // TODO: do something w/ the accumulated tables?
-                    handle_with(schema, with, &mut params);
+                    handle_with(schema, with, &mut params)?;
                 }
 
                 let mut tables: HashMap<String, &'schema Table> = Default::default();
@@ -3218,17 +3457,17 @@ fn parameter_types<'schema, 'stmt>(
                 }
 
                 if let Some(from) = from {
-                    let from_tables = handle_from(schema, from, &mut params);
+                    let from_tables = handle_from(schema, from, &mut params)?;
 
                     tables.extend(from_tables);
                 }
 
                 if let Some(where_clause) = where_clause {
                     trace!("WHERE CLAUSE: {where_clause:?}");
-                    extract_params(schema, where_clause, &tables, &mut params);
+                    extract_params(schema, where_clause, &tables, &mut params)?;
                 }
                 if let Some(limit) = limit {
-                    handle_limit(schema, limit, &tables, &mut params);
+                    handle_limit(schema, limit, &tables, &mut params)?;
                 }
             }
             _ => {
@@ -3237,7 +3476,7 @@ fn parameter_types<'schema, 'stmt>(
         }
     }
 
-    params
+    Ok(params)
 }
 
 enum FieldFormats<'a> {
@@ -3249,7 +3488,12 @@ impl<'a> FieldFormats<'a> {
     fn get(&self, i: usize) -> FieldFormat {
         match self {
             FieldFormats::All(format) => *format,
-            FieldFormats::Each(formats) => formats.get(i).copied().unwrap_or(FieldFormat::Text),
+            // If there is less formats than columns, use the first format for all columns
+            // Default to binary codecs if there are no formats
+            FieldFormats::Each(formats) => formats
+                .get(i)
+                .copied()
+                .unwrap_or(formats.first().copied().unwrap_or(FieldFormat::Binary)),
         }
     }
 }
@@ -3262,7 +3506,7 @@ fn field_types(
     let mut field_type_overrides = HashMap::new();
 
     match parsed_cmd {
-        ParsedCmd::Sqlite(Cmd::Stmt(stmt)) => match stmt {
+        ParsedCmd::Sqlite(Cmd::Stmt(
             Stmt::Select(Select {
                 body:
                     SelectBody {
@@ -3282,51 +3526,49 @@ fn field_types(
             | Stmt::Update {
                 returning: Some(cols),
                 ..
-            } => {
-                for (i, col) in cols.iter().enumerate() {
-                    if let ResultColumn::Expr(expr, _as) = col {
-                        let type_override = match expr {
-                            Expr::Cast { type_name, .. } => Some(name_to_type(&type_name.name)?),
-                            Expr::FunctionCall { name, .. }
-                            | Expr::FunctionCallStar { name, .. } => {
-                                match name.0.as_str().to_uppercase().as_ref() {
-                                    "COUNT" => Some(Type::INT8),
-                                    _ => None,
-                                }
-                            }
-                            Expr::Literal(lit) => match lit {
-                                Literal::Numeric(s) => Some(if s.contains('.') {
-                                    Type::FLOAT8
-                                } else {
-                                    Type::INT8
-                                }),
-                                Literal::String(_) => Some(Type::TEXT),
-                                Literal::Blob(_) => Some(Type::BYTEA),
-                                Literal::Keyword(_) => None,
-                                Literal::Null => None,
-                                Literal::CurrentDate => Some(Type::DATE),
-                                Literal::CurrentTime => Some(Type::TIME),
-                                Literal::CurrentTimestamp => Some(Type::TIMESTAMP),
-                            },
-                            _ => None,
-                        };
-                        if let Some(type_override) = type_override {
-                            match prepped.column_name(i) {
-                                Ok(col_name) => {
-                                    field_type_overrides.insert(col_name, type_override);
-                                }
-                                Err(e) => {
-                                    error!("col index didn't exist at {i}, attempted to override type as: {type_override}: {e}");
-                                }
+            },
+        )) => {
+            for (i, col) in cols.iter().enumerate() {
+                if let ResultColumn::Expr(expr, _as) = col {
+                    let type_override = match expr {
+                        Expr::Cast { type_name, .. } => Some(name_to_type(&type_name.name)?),
+                        Expr::FunctionCall { name, .. } | Expr::FunctionCallStar { name, .. } => {
+                            match name.0.as_str().to_uppercase().as_ref() {
+                                "COUNT" => Some(Type::INT8),
+                                _ => None,
                             }
                         }
-                    } else {
-                        break;
+                        Expr::Literal(lit) => match lit {
+                            Literal::Numeric(s) => Some(if s.contains('.') {
+                                Type::FLOAT8
+                            } else {
+                                Type::INT8
+                            }),
+                            Literal::String(_) => Some(Type::TEXT),
+                            Literal::Blob(_) => Some(Type::BYTEA),
+                            Literal::Keyword(_) => None,
+                            Literal::Null => None,
+                            Literal::CurrentDate => Some(Type::DATE),
+                            Literal::CurrentTime => Some(Type::TIME),
+                            Literal::CurrentTimestamp => Some(Type::TIMESTAMP),
+                        },
+                        _ => None,
+                    };
+                    if let Some(type_override) = type_override {
+                        match prepped.column_name(i) {
+                            Ok(col_name) => {
+                                field_type_overrides.insert(col_name, type_override);
+                            }
+                            Err(e) => {
+                                error!("col index didn't exist at {i}, attempted to override type as: {type_override}: {e}");
+                            }
+                        }
                     }
+                } else {
+                    break;
                 }
             }
-            _ => {}
-        },
+        }
         ParsedCmd::Postgres(_stmt) => {
             // TODO: handle type overrides here too
             // let cols = match stmt {
@@ -3373,530 +3615,4 @@ fn field_types(
     }
 
     Ok(fields)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        io::BufReader,
-        time::{Duration, Instant},
-    };
-
-    use camino::Utf8PathBuf;
-    use chrono::{DateTime, Utc};
-    use corro_tests::{launch_test_agent, TestAgent};
-    use corro_types::{
-        config::PgTlsConfig,
-        tls::{generate_ca, generate_client_cert, generate_server_cert},
-    };
-    use rcgen::Certificate;
-    use spawn::wait_for_all_pending_handles;
-    use tempfile::TempDir;
-    use tokio_postgres::NoTls;
-    use tokio_postgres_rustls::MakeRustlsConnect;
-    use tripwire::Tripwire;
-
-    use super::*;
-
-    async fn setup_pg_test_server(
-        tripwire: Tripwire,
-        tls_config: Option<PgTlsConfig>,
-    ) -> Result<(TestAgent, PgServer), BoxError> {
-        _ = tracing_subscriber::fmt::try_init();
-
-        let tmpdir = tempfile::tempdir()?;
-
-        tokio::fs::write(
-            tmpdir.path().join("kitchensink.sql"),
-            "
-            CREATE TABLE kitchensink (
-                id BIGINT PRIMARY KEY NOT NULL,
-                other_ts DATETIME,
-                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-        ",
-        )
-        .await?;
-
-        let ta = launch_test_agent(
-            |builder| {
-                builder
-                    .add_schema_path(tmpdir.path().display().to_string())
-                    .build()
-            },
-            tripwire.clone(),
-        )
-        .await?;
-
-        let server = start(
-            ta.agent.clone(),
-            PgConfig {
-                bind_addr: "127.0.0.1:0".parse()?,
-                tls: tls_config,
-            },
-            tripwire,
-        )
-        .await?;
-
-        Ok((ta, server))
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_pg() -> Result<(), BoxError> {
-        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-
-        let (ta, server) = setup_pg_test_server(tripwire, None).await?;
-
-        let sema = ta.agent.write_sema().clone();
-
-        let conn_str = format!(
-            "host={} port={} user=testuser",
-            server.local_addr.ip(),
-            server.local_addr.port()
-        );
-
-        {
-            let (mut client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
-            // let (mut client, client_conn) =
-            // tokio_postgres::connect("host=localhost port=5432 user=jerome", NoTls).await?;
-            println!("client is ready!");
-            tokio::spawn(client_conn);
-
-            let _permit = sema.acquire().await;
-
-            println!("before prepare");
-            let stmt = client.prepare("SELECT 1").await?;
-            println!(
-                "after prepare: params: {:?}, columns: {:?}",
-                stmt.params(),
-                stmt.columns()
-            );
-
-            println!("before query");
-            // add a timeout because the semaphore shouldn't block anything here
-            // it will fail if the semaphore prevents this query.
-            let rows = tokio::time::timeout(Duration::from_millis(100), client.query(&stmt, &[]))
-                .await??;
-
-            println!("rows count: {}", rows.len());
-            for row in rows {
-                println!("ROW!!! {row:?}");
-            }
-
-            println!("before execute");
-            let start = Instant::now();
-            let (affected_res, sema_elapsed) = tokio::join!(
-                async {
-                    let affected = client
-                        .execute("INSERT INTO tests VALUES (1,2)", &[])
-                        .await?;
-                    Ok::<_, tokio_postgres::Error>((affected, start.elapsed()))
-                },
-                async move {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    drop(_permit);
-                    start.elapsed()
-                }
-            );
-
-            let (affected, exec_elapsed) = affected_res?;
-
-            println!("after execute, affected: {affected}, sema elapsed: {sema_elapsed:?}, exec elapsed: {exec_elapsed:?}");
-
-            assert_eq!(affected, 1);
-
-            assert!(exec_elapsed > sema_elapsed);
-
-            let row = client.query_one("SELECT * FROM crsql_changes", &[]).await?;
-            println!("CHANGE ROW: {row:?}");
-
-            let row = client
-                .query_one("SELECT * FROM __corro_bookkeeping", &[])
-                .await?;
-            println!("BK ROW: {row:?}");
-
-            client
-                .batch_execute("SELECT 1; SELECT 2; SELECT 3;")
-                .await?;
-            println!("after batch exec");
-
-            client.batch_execute("SELECT 1; BEGIN; SELECT 3;").await?;
-            println!("after batch exec 2");
-
-            client.batch_execute("SELECT 3; COMMIT; SELECT 3;").await?;
-            println!("after batch exec 3");
-
-            let tx = client.transaction().await?;
-            println!("after begin I assume");
-            let res = tx
-                .execute(
-                    "INSERT INTO tests VALUES ($1, $2)",
-                    &[&2i64, &"hello world"],
-                )
-                .await?;
-            println!("res (rows affected): {res}");
-            let res = tx
-                .execute(
-                    "INSERT INTO tests2 VALUES ($1, $2)",
-                    &[&2i64, &"hello world 2"],
-                )
-                .await?;
-            println!("res (rows affected): {res}");
-            tx.commit().await?;
-            println!("after commit");
-
-            let row = client
-                .query_one("SELECT * FROM tests t WHERE t.id = ?", &[&2i64])
-                .await?;
-            println!("ROW: {row:?}");
-
-            let row = client
-                .query_one("SELECT * FROM tests t WHERE t.id = ?", &[&2i64])
-                .await?;
-            println!("ROW: {row:?}");
-
-            let row = client
-                .query_one("SELECT * FROM tests t WHERE t.id IN (?)", &[&2i64])
-                .await?;
-            println!("ROW: {row:?}");
-
-            let row = client
-        .query_one("SELECT t.id, t.text, t2.text as t2text FROM tests t LEFT JOIN tests2 t2 WHERE t.id = ? LIMIT ?", &[&2i64, &1i64])
-        .await?;
-            println!("ROW: {row:?}");
-
-            println!("t.id: {:?}", row.try_get::<_, i64>(0));
-            println!("t.text: {:?}", row.try_get::<_, String>(1));
-            println!("t2text: {:?}", row.try_get::<_, String>(2));
-
-            let now: DateTime<Utc> = Utc::now();
-            let now = NaiveDateTime::from_timestamp_micros(now.timestamp_micros()).unwrap();
-            println!("NOW: {now:?}");
-
-            let row = client
-                .query_one(
-                    "INSERT INTO kitchensink (other_ts, id, updated_at) VALUES (?1, ?2, ?1) RETURNING updated_at",
-                    &[&now, &1i64],
-                )
-                .await?;
-
-            println!("ROW: {row:?}");
-            let updated_at = row.try_get::<_, NaiveDateTime>(0)?;
-            println!("updated_at: {updated_at:?}");
-
-            assert_eq!(now, updated_at);
-
-            let future: DateTime<Utc> = Utc::now() + Duration::from_secs(1);
-            let future = NaiveDateTime::from_timestamp_micros(future.timestamp_micros()).unwrap();
-            println!("NOW: {future:?}");
-
-            let row = client
-                .query_one(
-                    "UPDATE kitchensink SET other_ts = $ts, updated_at = $ts WHERE id = $id AND updated_at > ? RETURNING updated_at",
-                    &[&future, &1i64, &(now - Duration::from_secs(1))],
-                )
-                .await?;
-
-            println!("ROW: {row:?}");
-            let updated_at = row.try_get::<_, NaiveDateTime>(0)?;
-            println!("updated_at: {updated_at:?}");
-
-            assert_eq!(future, updated_at);
-
-            let row = client
-                .query_one(
-                    "SELECT COUNT(*) AS yep, COUNT(id) yeppers FROM kitchensink",
-                    &[],
-                )
-                .await?;
-            println!("COUNT ROW: {row:?}");
-        }
-
-        tripwire_tx.send(()).await.ok();
-        tripwire_worker.await;
-        wait_for_all_pending_handles().await;
-
-        Ok(())
-    }
-
-    struct TestCertificates {
-        ca_cert: Certificate,
-        client_cert_signed: String,
-        client_key: Vec<u8>,
-        ca_file: Utf8PathBuf,
-        server_cert_file: Utf8PathBuf,
-        server_key_file: Utf8PathBuf,
-    }
-
-    async fn generate_and_write_certs(tmpdir: &TempDir) -> Result<TestCertificates, BoxError> {
-        let ca_cert = generate_ca()?;
-        let (server_cert, server_cert_signed) = generate_server_cert(
-            &ca_cert.serialize_pem()?,
-            &ca_cert.serialize_private_key_pem(),
-            "127.0.0.1".parse()?,
-        )?;
-
-        let (client_cert, client_cert_signed) = generate_client_cert(
-            &ca_cert.serialize_pem()?,
-            &ca_cert.serialize_private_key_pem(),
-        )?;
-
-        let base_path = Utf8PathBuf::from(tmpdir.path().display().to_string());
-
-        let cert_file = base_path.join("cert.pem");
-        let key_file = base_path.join("cert.key");
-        let ca_file = base_path.join("ca.pem");
-
-        let client_cert_file = base_path.join("client-cert.pem");
-        let client_key_file = base_path.join("client-cert.key");
-
-        tokio::fs::write(&cert_file, &server_cert_signed).await?;
-        tokio::fs::write(&key_file, server_cert.serialize_private_key_pem()).await?;
-
-        tokio::fs::write(&ca_file, ca_cert.serialize_pem()?).await?;
-
-        tokio::fs::write(&client_cert_file, &client_cert_signed).await?;
-        tokio::fs::write(&client_key_file, client_cert.serialize_private_key_pem()).await?;
-
-        Ok(TestCertificates {
-            server_cert_file: cert_file,
-            server_key_file: key_file,
-            ca_cert,
-            client_cert_signed: client_cert_signed,
-            client_key: client_cert.serialize_private_key_der(),
-            ca_file,
-        })
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_pg_ssl() -> Result<(), BoxError> {
-        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-
-        let tmpdir = TempDir::new()?;
-        let certs = generate_and_write_certs(&tmpdir).await?;
-
-        let (ta, server) = setup_pg_test_server(
-            tripwire,
-            Some(PgTlsConfig {
-                cert_file: certs.server_cert_file,
-                key_file: certs.server_key_file,
-                ca_file: None,
-                verify_client: false,
-            }),
-        )
-        .await?;
-
-        let sema = ta.agent.write_sema().clone();
-
-        let conn_str = format!(
-            "host={} port={} user=testuser",
-            server.local_addr.ip(),
-            server.local_addr.port()
-        );
-
-        {
-            let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
-            root_cert_store.add(&rustls::Certificate(certs.ca_cert.serialize_der()?))?;
-            let config = rustls::ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(root_cert_store)
-                .with_no_client_auth();
-
-            let connector = MakeRustlsConnect::new(config);
-
-            println!("connecting to: {conn_str}");
-
-            let (client, client_conn) = tokio_postgres::connect(&conn_str, connector).await?;
-
-            tokio::spawn(client_conn);
-
-            let _permit = sema.acquire().await;
-
-            println!("before query");
-
-            client.simple_query("SELECT 1").await?;
-        }
-
-        tripwire_tx.send(()).await.ok();
-        tripwire_worker.await;
-        wait_for_all_pending_handles().await;
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_pg_mtls() -> Result<(), BoxError> {
-        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-
-        let tmpdir = TempDir::new()?;
-
-        let certs = generate_and_write_certs(&tmpdir).await?;
-
-        let (ta, server) = setup_pg_test_server(
-            tripwire,
-            Some(PgTlsConfig {
-                cert_file: certs.server_cert_file,
-                key_file: certs.server_key_file,
-                ca_file: Some(certs.ca_file),
-                verify_client: true,
-            }),
-        )
-        .await?;
-
-        let sema = ta.agent.write_sema().clone();
-
-        let conn_str = format!(
-            "host={} port={} user=testuser",
-            server.local_addr.ip(),
-            server.local_addr.port()
-        );
-
-        {
-            let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
-            root_cert_store.add(&rustls::Certificate(certs.ca_cert.serialize_der()?))?;
-
-            let client_cert =
-                rustls_pemfile::certs(&mut BufReader::new(certs.client_cert_signed.as_bytes()))
-                    .map_err(|e| format!("failed to read client cert: {e}"))?;
-
-            let client_cert: Vec<rustls::Certificate> = client_cert
-                .iter()
-                .map(|cert| rustls::Certificate(cert.clone()))
-                .collect();
-
-            let config = rustls::ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(root_cert_store.clone())
-                .with_client_auth_cert(client_cert, rustls::PrivateKey(certs.client_key))?;
-
-            let connector = MakeRustlsConnect::new(config);
-
-            println!("connecting to: {conn_str} with client auth cert");
-            let (client, client_conn) = tokio_postgres::connect(&conn_str, connector).await?;
-
-            tokio::spawn(client_conn);
-
-            println!("successfully connected!");
-
-            let _permit = sema.acquire().await;
-
-            client.simple_query("SELECT 1").await?;
-
-            let config = rustls::ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(root_cert_store)
-                .with_no_client_auth();
-
-            let connector = MakeRustlsConnect::new(config);
-
-            println!("connecting to: {conn_str} without client auth cert");
-            let result = tokio_postgres::connect(&conn_str, connector).await;
-            assert!(
-                result.is_err(),
-                "expected connect to fail without client auth cert"
-            );
-
-            println!("successfully failed to connect without client auth cert");
-        }
-
-        tripwire_tx.send(()).await.ok();
-        tripwire_worker.await;
-        wait_for_all_pending_handles().await;
-
-        Ok(())
-    }
-
-    // #[tokio::test(flavor = "multi_thread")]
-    // async fn test_write_permit_released_on_error() -> Result<(), BoxError> {
-    //     _ = tracing_subscriber::fmt::try_init();
-    //     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-    //     let tmpdir = tempfile::tempdir()?;
-
-    //     // Create a test table that will help us verify transaction state
-    //     tokio::fs::write(
-    //         tmpdir.path().join("test.sql"),
-    //         "CREATE TABLE test (id INTEGER PRIMARY KEY NOT NULL, value TEXT);",
-    //     )
-    //     .await?;
-
-    //     let ta = launch_test_agent(
-    //         |builder| {
-    //             builder
-    //                 .add_schema_path(tmpdir.path().display().to_string())
-    //                 .build()
-    //         },
-    //         tripwire.clone(),
-    //     )
-    //     .await?;
-
-    //     let server = start(
-    //         ta.agent.clone(),
-    //         PgConfig {
-    //             bind_addr: "127.0.0.1:0".parse()?,
-    //         },
-    //         tripwire,
-    //     )
-    //     .await?;
-
-    //     let conn_str = format!(
-    //         "host={} port={} user=testuser",
-    //         server.local_addr.ip(),
-    //         server.local_addr.port()
-    //     );
-
-    //     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await?;
-    //     tokio::spawn(connection);
-
-    //     println!("before begin");
-
-    //     // Start transaction
-    //     client.execute("BEGIN", &[]).await?;
-
-    //     println!("after begin");
-
-    //     // Insert valid data to acquire write permit
-    //     client
-    //         .execute("INSERT INTO test (id, value) VALUES (1, 'test')", &[])
-    //         .await?;
-
-    //     // Attempt an invalid insert that will error
-    //     let err = client
-    //         .execute("INSERT INTO test (id, value) VALUES (1, 'duplicate')", &[])
-    //         .await
-    //         .unwrap_err();
-    //     assert!(err.to_string().contains("UNIQUE constraint failed"));
-    //     println!("after error");
-
-    //     // Verify we can still query in failed transaction
-    //     let rows = client.query("SELECT 1", &[]).await.unwrap();
-    //     assert_eq!(
-    //         rows.len(),
-    //         1,
-    //         "Query should succeed but transaction should be marked as failed"
-    //     );
-
-    //     // Try another write - should fail since we're in failed transaction
-    //     let err = client
-    //         .execute("INSERT INTO test (id, value) VALUES (2, 'test2')", &[])
-    //         .await
-    //         .unwrap_err();
-    //     assert!(err.to_string().contains("current transaction is aborted"));
-
-    //     // Verify ROLLBACK works and clears the failed state
-    //     client.execute("ROLLBACK", &[]).await?;
-
-    //     // Verify we can start a new transaction
-    //     client.execute("BEGIN", &[]).await?;
-    //     client
-    //         .execute("INSERT INTO test (id, value) VALUES (2, 'test2')", &[])
-    //         .await?;
-    //     client.execute("COMMIT", &[]).await?;
-
-    //     // Cleanup
-    //     tripwire_tx.send(()).await.ok();
-    //     tripwire_worker.await;
-    //     wait_for_all_pending_handles().await;
-
-    //     Ok(())
-    // }
 }

@@ -1,10 +1,13 @@
 use std::{
     collections::BTreeSet,
+    net::SocketAddr,
     ops::Deref,
     time::{Duration, Instant},
 };
 
-use axum::{response::IntoResponse, Extension};
+use crate::api::utils::CountedBody;
+use antithesis_sdk::assert_sometimes;
+use axum::{extract::ConnectInfo, response::IntoResponse, Extension};
 use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
@@ -13,13 +16,15 @@ use corro_types::{
         ColumnName, ExecResponse, ExecResult, QueryEvent, Statement, TableStatRequest,
         TableStatResponse,
     },
-    base::Version,
+    base::CrsqlDbVersion,
+    broadcast::Timestamp,
     change::{insert_local_changes, InsertChangesInfo, SqliteValue},
+    persistent_gauge,
     schema::{apply_schema, parse_sql},
     sqlite::SqlitePoolError,
 };
 use hyper::StatusCode;
-use metrics::histogram;
+use metrics::{counter, histogram};
 use rusqlite::{params_from_iter, ToSql, Transaction};
 use serde::Deserialize;
 use spawn::spawn_counted;
@@ -32,7 +37,8 @@ use tokio::{
     },
     task::block_in_place,
 };
-use tracing::{debug, error, info, trace};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, trace, warn};
 
 use corro_types::broadcast::broadcast_changes;
 
@@ -41,18 +47,18 @@ pub mod pubsub;
 pub mod update;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
-pub struct TransactionParams {
+pub struct TimeoutParams {
     #[serde(default)]
     pub timeout: Option<u64>,
 }
 
 pub async fn make_broadcastable_changes<F, T>(
     agent: &Agent,
-    params: TransactionParams,
+    timeout: Option<u64>,
     f: F,
-) -> Result<(T, Option<Version>, Duration), ChangeError>
+) -> Result<(T, Option<CrsqlDbVersion>, Duration), ChangeError>
 where
-    F: Fn(&InterruptibleTransaction<Transaction>) -> Result<T, ChangeError>,
+    F: FnOnce(&InterruptibleTransaction<Transaction>) -> Result<T, ChangeError>,
 {
     trace!("getting conn...");
     let mut conn = agent.pool().write_priority().await?;
@@ -67,6 +73,8 @@ where
         .await;
 
     let start = Instant::now();
+    let ts = Timestamp::from(agent.clock().new_timestamp());
+
     block_in_place(move || {
         let tx = conn
             .immediate_transaction()
@@ -76,8 +84,22 @@ where
                 version: None,
             })?;
 
-        let timeout = params.timeout.map(Duration::from_secs);
+        let timeout = timeout.map(Duration::from_secs);
         let tx = InterruptibleTransaction::new(tx, timeout, "local_changes");
+
+        let _ = tx
+            .prepare_cached("SELECT crsql_set_ts(?)")
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?
+            .query_row([&ts], |row| row.get::<_, String>(0))
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
 
         // Execute whatever might mutate state data
         let ret = f(&tx)?;
@@ -86,7 +108,7 @@ where
         tx.commit().map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
-            version: insert_info.as_ref().map(|info| info.version),
+            version: insert_info.as_ref().map(|info| info.db_version),
         })?;
 
         let elapsed = start.elapsed();
@@ -96,7 +118,6 @@ where
         match insert_info {
             None => Ok((ret, None, elapsed)),
             Some(InsertChangesInfo {
-                version,
                 db_version,
                 last_seq,
                 ts,
@@ -108,11 +129,11 @@ where
 
                 let agent = agent.clone();
 
-                spawn_counted(async move {
-                    broadcast_changes(agent, db_version, last_seq, version, ts).await
-                });
+                spawn_counted(
+                    async move { broadcast_changes(agent, db_version, last_seq, ts).await },
+                );
 
-                Ok::<_, ChangeError>((ret, Some(version), elapsed))
+                Ok::<_, ChangeError>((ret, Some(db_version), elapsed))
             }
         }
     })
@@ -158,9 +179,10 @@ where
 pub async fn api_v1_transactions(
     // axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     Extension(agent): Extension<Agent>,
-    axum::extract::Query(params): axum::extract::Query<TransactionParams>,
+    axum::extract::Query(params): axum::extract::Query<TimeoutParams>,
     axum::extract::Json(statements): axum::extract::Json<Vec<Statement>>,
 ) -> (StatusCode, axum::Json<ExecResponse>) {
+    let actor_id = agent.actor_id().to_string();
     if statements.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -170,11 +192,14 @@ pub async fn api_v1_transactions(
                 }],
                 time: 0.0,
                 version: None,
+                actor_id: Some(actor_id),
             }),
         );
     }
 
-    let res = make_broadcastable_changes(&agent, params, move |tx| {
+    counter!("corro.api.connection.count", "protocol" => "http").increment(1);
+    assert_sometimes!(true, "Corrosion receives transactions through HTTP API");
+    let res = make_broadcastable_changes(&agent, params.timeout, move |tx| {
         let mut total_rows_affected = 0;
 
         let results = statements
@@ -216,6 +241,7 @@ pub async fn api_v1_transactions(
                     }],
                     time: 0.0,
                     version: None,
+                    actor_id: Some(actor_id),
                 }),
             );
         }
@@ -227,6 +253,7 @@ pub async fn api_v1_transactions(
             results,
             time: elapsed.as_secs_f64(),
             version: version.map(Into::into),
+            actor_id: Some(actor_id),
         }),
     )
 }
@@ -241,8 +268,10 @@ pub enum QueryError {
 
 async fn build_query_rows_response(
     agent: &Agent,
+    client_addr: SocketAddr,
     data_tx: mpsc::Sender<QueryEvent>,
     stmt: Statement,
+    timeout: Option<u64>,
 ) -> Result<(), (StatusCode, ExecResult)> {
     let (res_tx, res_rx) = oneshot::channel();
 
@@ -261,6 +290,8 @@ async fn build_query_rows_response(
                 return;
             }
         };
+
+        trace!(%client_addr, "Preparing statement {}", stmt.query());
 
         let prepped_res = block_in_place(|| conn.prepare(stmt.query()));
 
@@ -287,6 +318,31 @@ async fn build_query_rows_response(
             return;
         }
 
+        let timeout = timeout.unwrap_or(4);
+        let timeout: Option<Duration> = if timeout > 0 {
+            Some(Duration::from_secs(timeout * 60))
+        } else {
+            None
+        };
+
+        let int_handle = conn.get_interrupt_handle();
+        let token = CancellationToken::new();
+        if let Some(timeout) = timeout {
+            let cloned_token = token.clone();
+            let stmt_query = stmt.query().to_string();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = cloned_token.cancelled() => {}
+                    _ = tokio::time::sleep(timeout) => {
+                        warn!("sql call took more than {timeout:?}, interrupting stmt- {:?}", stmt_query);
+                        int_handle.interrupt();
+                        counter!("corro.sqlite.interrupt", "source" => "timeout").increment(1);
+                    }
+                };
+            });
+        }
+
+        let _dropguard = token.drop_guard();
         block_in_place(|| {
             let col_count = prepped.column_count();
             trace!("inside block in place, col count: {col_count}");
@@ -304,7 +360,10 @@ async fn build_query_rows_response(
 
             let start = Instant::now();
 
-            let query = match stmt {
+            trace!(%client_addr, "Executing statement {}", stmt.query());
+            let elapsed = start.elapsed();
+
+            let query = match &stmt {
                 Statement::Simple(_)
                 | Statement::Verbose {
                     params: None,
@@ -341,7 +400,12 @@ async fn build_query_rows_response(
                     return;
                 }
             };
-            let elapsed = start.elapsed();
+
+            trace!(%client_addr, elapsed = %elapsed.as_secs(), "Statement finished executing {}", stmt.query());
+
+            if elapsed > Duration::from_secs(10) {
+                warn!(%client_addr, elapsed = %elapsed.as_secs(), "Slow read statement {}!", stmt.query());
+            }
 
             if let Err(_e) = res_tx.send(Ok(())) {
                 error!("could not send back response through oneshot channel, aborting");
@@ -406,13 +470,19 @@ async fn build_query_rows_response(
 
 pub async fn api_v1_queries(
     Extension(agent): Extension<Agent>,
+    ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
+    axum::extract::Query(params): axum::extract::Query<TimeoutParams>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
-    let (mut tx, body) = hyper::Body::channel();
+    let (mut tx, body) = CountedBody::channel(
+        persistent_gauge!("corro.api.active.streams", "source" => "queries", "protocol" => "http"),
+    );
 
+    counter!("corro.api.queries.count").increment(1);
     // TODO: timeout on data send instead of infinitely waiting for channel space.
     let (data_tx, mut data_rx) = channel(512);
 
+    let start = Instant::now();
     tokio::spawn(async move {
         let mut buf = BytesMut::new();
 
@@ -444,30 +514,33 @@ pub async fn api_v1_queries(
     });
 
     trace!("building query rows response...");
+    assert_sometimes!(true, "Corrosion accepts queries");
 
-    match build_query_rows_response(&agent, data_tx, stmt).await {
+    match build_query_rows_response(&agent, client_addr, data_tx, stmt, params.timeout).await {
         Ok(_) => {
-            #[allow(clippy::needless_return)]
-            return hyper::Response::builder()
+            histogram!("corro.api.queries.processing.time.seconds", "result" => "success")
+                .record(start.elapsed());
+            hyper::Response::builder()
                 .status(StatusCode::OK)
-                .body(body)
-                .expect("could not build query response body");
+                .body(axum::body::Body::new(body))
+                .expect("could not build query response body")
         }
         Err((status, res)) => {
-            #[allow(clippy::needless_return)]
-            return hyper::Response::builder()
+            histogram!("corro.api.queries.processing.time.seconds", "result" => "error")
+                .record(start.elapsed());
+            hyper::Response::builder()
                 .status(status)
                 .body(
                     serde_json::to_vec(&res)
                         .expect("could not serialize query error response")
                         .into(),
                 )
-                .expect("could not build query response body");
+                .expect("could not build query response body")
         }
     }
 }
 
-async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<()> {
+pub(crate) async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<()> {
     let new_sql: String = statements.join(";");
 
     let partial_schema = parse_sql(&new_sql)?;
@@ -491,7 +564,9 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
 
     new_schema.constrain()?;
 
-    block_in_place(|| {
+    // conn.trace(Some(|sql| debug!(sql)));
+
+    let apply_res = block_in_place(|| {
         let tx = conn.immediate_transaction()?;
 
         apply_schema(&tx, &schema_write, &mut new_schema)?;
@@ -505,8 +580,15 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
 
         tx.commit()?;
 
+        // drain the pool of RO connections because they might not get the new tables in cr-sqlite!
+        agent.pool().drain_read();
+
         Ok::<_, eyre::Report>(())
-    })?;
+    });
+
+    // conn.trace(None);
+
+    apply_res?;
 
     *schema_write = new_schema;
 
@@ -517,6 +599,7 @@ pub async fn api_v1_db_schema(
     Extension(agent): Extension<Agent>,
     axum::extract::Json(statements): axum::extract::Json<Vec<String>>,
 ) -> (StatusCode, axum::Json<ExecResponse>) {
+    let actor_id = agent.actor_id().to_string();
     if statements.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -526,12 +609,14 @@ pub async fn api_v1_db_schema(
                 }],
                 time: 0.0,
                 version: None,
+                actor_id: Some(actor_id),
             }),
         );
     }
 
     let start = Instant::now();
 
+    assert_sometimes!(true, "Corrosion applies schema");
     if let Err(e) = execute_schema(&agent, statements).await {
         error!("could not merge schemas: {e}");
         return (
@@ -542,6 +627,7 @@ pub async fn api_v1_db_schema(
                 }],
                 time: 0.0,
                 version: None,
+                actor_id: Some(actor_id),
             }),
         );
     }
@@ -552,6 +638,7 @@ pub async fn api_v1_db_schema(
             results: vec![],
             time: start.elapsed().as_secs_f64(),
             version: None,
+            actor_id: Some(actor_id),
         }),
     )
 }
@@ -620,16 +707,14 @@ pub async fn api_v1_table_stats(
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
     use corro_types::{
         api::RowId,
-        base::Version,
+        base::CrsqlDbVersion,
         broadcast::{BroadcastInput, BroadcastV1, ChangeV1, Changeset},
         config::Config,
         schema::SqliteType,
     };
-    use futures::Stream;
-    use http_body::{combinators::UnsyncBoxBody, Body};
+    use futures::StreamExt;
     use tokio::sync::mpsc::error::TryRecvError;
     use tokio_util::codec::{Decoder, LinesCodec};
     use tripwire::Tripwire;
@@ -637,19 +722,6 @@ mod tests {
     use super::*;
 
     use crate::agent::setup;
-
-    struct UnsyncBodyStream(std::pin::Pin<Box<UnsyncBoxBody<Bytes, axum::Error>>>);
-
-    impl Stream for UnsyncBodyStream {
-        type Item = Result<Bytes, axum::Error>;
-
-        fn poll_next(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Option<Self::Item>> {
-            self.0.as_mut().poll_data(cx)
-        }
-    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_db_execute() -> eyre::Result<()> {
@@ -681,7 +753,7 @@ mod tests {
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
-            axum::extract::Query(TransactionParams { timeout: None }),
+            axum::extract::Query(TimeoutParams { timeout: None }),
             axum::Json(vec![Statement::WithParams(
                 "insert into tests (id, text) values (?,?)".into(),
                 vec!["service-id".into(), "service-name".into()],
@@ -703,8 +775,8 @@ mod tests {
         assert!(matches!(
             msg,
             BroadcastInput::AddBroadcast(BroadcastV1::Change(ChangeV1 {
-                changeset: Changeset::Full {
-                    version: Version(1),
+                changeset: Changeset::FullV2 {
+                    version: CrsqlDbVersion(1),
                     ..
                 },
                 ..
@@ -713,14 +785,14 @@ mod tests {
 
         assert_eq!(
             agent.booked().read::<&str, _>("test", None).await.last(),
-            Some(Version(1))
+            Some(CrsqlDbVersion(1))
         );
 
         println!("second req...");
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
-            axum::extract::Query(TransactionParams { timeout: None }),
+            axum::extract::Query(TimeoutParams { timeout: None }),
             axum::Json(vec![Statement::WithParams(
                 "update tests SET text = ? where id = ?".into(),
                 vec!["service-name".into(), "service-id".into()],
@@ -768,7 +840,7 @@ mod tests {
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
-            axum::extract::Query(TransactionParams { timeout: None }),
+            axum::extract::Query(TimeoutParams { timeout: None }),
             axum::Json(vec![
                 Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),
@@ -792,6 +864,8 @@ mod tests {
 
         let res = api_v1_queries(
             Extension(agent.clone()),
+            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
             axum::Json(Statement::Simple("select * from tests".into())),
         )
         .await
@@ -799,13 +873,13 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::OK);
 
-        let mut body = res.into_body();
+        let mut body = res.into_body().into_data_stream();
 
         let mut lines = LinesCodec::new();
 
         let mut buf = BytesMut::new();
 
-        buf.extend_from_slice(&body.data().await.unwrap()?);
+        buf.extend_from_slice(&body.next().await.unwrap()?);
 
         let s = lines.decode(&mut buf).unwrap().unwrap();
 
@@ -813,7 +887,7 @@ mod tests {
 
         assert_eq!(cols, QueryEvent::Columns(vec!["id".into(), "text".into()]));
 
-        buf.extend_from_slice(&body.data().await.unwrap()?);
+        buf.extend_from_slice(&body.next().await.unwrap()?);
 
         let s = lines.decode(&mut buf).unwrap().unwrap();
 
@@ -824,7 +898,7 @@ mod tests {
             QueryEvent::Row(RowId(1), vec!["service-id".into(), "service-name".into()])
         );
 
-        buf.extend_from_slice(&body.data().await.unwrap()?);
+        buf.extend_from_slice(&body.next().await.unwrap()?);
 
         let s = lines.decode(&mut buf).unwrap().unwrap();
 
@@ -838,7 +912,7 @@ mod tests {
             )
         );
 
-        buf.extend_from_slice(&body.data().await.unwrap()?);
+        buf.extend_from_slice(&body.next().await.unwrap()?);
 
         let s = lines.decode(&mut buf).unwrap().unwrap();
 
@@ -846,7 +920,7 @@ mod tests {
 
         assert!(matches!(query_evt, QueryEvent::EndOfQuery { .. }));
 
-        assert!(body.data().await.is_none());
+        assert!(body.next().await.is_none());
 
         Ok(())
     }

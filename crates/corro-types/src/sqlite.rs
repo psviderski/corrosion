@@ -1,13 +1,19 @@
 use std::{
     ops::{Deref, DerefMut},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use once_cell::sync::Lazy;
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::types::{ToSql, ToSqlOutput, Value};
+use rusqlite::{
+    params, trace::TraceEventCodes, vtab::eponymous_only_module, Connection, Transaction,
+};
 use sqlite_pool::{Committable, SqliteConn};
+use std::rc::Rc;
 use tempfile::TempDir;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
+
+use crate::vtab::unnest::UnnestTab;
 
 pub type SqlitePool = sqlite_pool::Pool<CrConn>;
 pub type SqlitePoolError = sqlite_pool::PoolError;
@@ -21,8 +27,6 @@ pub const CRSQL_EXT_FILENAME: &str = "crsqlite.so";
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-darwin-aarch64.dylib");
-#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-darwin-x86_64.dylib");
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-linux-x86_64.so");
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
@@ -38,10 +42,47 @@ static CRSQL_EXT_DIR: Lazy<TempDir> = Lazy::new(|| {
     dir
 });
 
+pub fn rusqlite_to_crsqlite_write(conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
+    let conn = rusqlite_to_crsqlite(conn)?;
+    conn.execute_batch("PRAGMA cache_size = -32000;")?;
+
+    Ok(conn)
+}
+
+// Due to an unknown bug, when this query get's prepared inside process_single_change_loop
+// It sometimes decides to not return any rows, even though it should
+// By preparing it when initializing the connection, it just works.
+pub const INSERT_CRSQL_CHANGES_QUERY: &str = r#"
+    INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
+        SELECT value0, value1, value2, value3, value4, value5, value6, value7, value8, value9
+        FROM unnest(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        -- WARNING: This returns a row BEFORE inserting not after
+        RETURNING db_version, seq, last_insert_rowid()
+    "#;
+
 pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
     init_cr_conn(&mut conn)?;
     setup_conn(&conn)?;
     sqlite_functions::add_to_connection(&conn)?;
+
+    // Prepare problematic queries here to avoid issues
+    // DON'T TOUCH IT, There are many dragons to tackle if u remove it
+    // If we don't prepare it here, there's a chance invalid VDBE will get generated
+    // I spent too much time debugging, it looks like a real bug in sqlite .-.
+    let _ = conn.prepare_cached(INSERT_CRSQL_CHANGES_QUERY)?;
+
+    const SLOW_THRESHOLD: Duration = Duration::from_secs(1);
+    conn.trace_v2(
+        TraceEventCodes::SQLITE_TRACE_PROFILE,
+        Some(|event| {
+            if let rusqlite::trace::TraceEvent::Profile(stmt_ref, duration) = event {
+                if duration >= SLOW_THRESHOLD {
+                    warn!("SLOW query {duration:?} => {}", stmt_ref.sql());
+                }
+            }
+        }),
+    );
+
     Ok(CrConn(conn))
 }
 
@@ -54,7 +95,7 @@ impl CrConn {
         Ok(Self(conn))
     }
 
-    pub fn immediate_transaction(&mut self) -> rusqlite::Result<Transaction> {
+    pub fn immediate_transaction(&mut self) -> rusqlite::Result<Transaction<'_>> {
         self.0
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
     }
@@ -128,10 +169,14 @@ pub fn setup_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
             PRAGMA journal_size_limit = 1073741824;
             PRAGMA synchronous = NORMAL;
             PRAGMA recursive_triggers = ON;
+            PRAGMA mmap_size = 8589934592; -- 8GB
         "#,
     )?;
 
     rusqlite::vtab::series::load_module(conn)?;
+
+    // Register unnest for PostgreSQL-style multi-array unnesting
+    conn.create_module("unnest", eponymous_only_module::<UnnestTab>(), None)?;
 
     Ok(())
 }
@@ -180,6 +225,11 @@ pub fn migrate(conn: &mut Connection, migrations: Vec<Box<dyn Migration>>) -> ru
     // determine how many migrations to skip (skip as many as we are at)
     let skip_n = migration_version(&tx).unwrap_or_default();
 
+    if skip_n > migrations.len() {
+        warn!("Skipping migrations, database is at migration version {skip_n} which is greater than {}", migrations.len());
+        return Ok(());
+    }
+
     for (i, migration) in migrations.into_iter().skip(skip_n).enumerate() {
         let new_version = skip_n + i;
         info!("Applying migration to v{new_version}");
@@ -191,6 +241,26 @@ pub fn migrate(conn: &mut Connection, migrations: Vec<Box<dyn Migration>>) -> ru
 
     tx.commit()?;
     Ok(())
+}
+
+// Converts any iterator over something convertible to SQL
+// into a vector of SQL values, which can be used as a parameter
+// to the `unnest` function in SQL.
+// Due to limitations in rusqlite we need to use owned values
+pub fn unnest_param<T, K>(iter: T) -> Rc<Vec<Value>>
+where
+    T: IntoIterator<Item = K>,
+    K: ToSql,
+{
+    Rc::new(
+        iter.into_iter()
+            .map(|to_sql| match to_sql.to_sql() {
+                Ok(ToSqlOutput::Borrowed(v)) => v.into(),
+                Ok(ToSqlOutput::Owned(v)) => v,
+                _ => panic!("Nope"),
+            })
+            .collect::<Vec<Value>>(),
+    )
 }
 
 #[cfg(test)]
@@ -228,7 +298,7 @@ mod tests {
             let pool = pool.clone();
             async move {
                 tokio::spawn(async move {
-                    FuturesUnordered::from_iter((0..per_worker).map(|_| {
+                    let _: () = FuturesUnordered::from_iter((0..per_worker).map(|_| {
                         let pool = pool.clone();
                         async move {
                             let conn = pool.get().await?;
@@ -251,7 +321,7 @@ mod tests {
             }
         }));
 
-        futs.try_collect().await?;
+        let _: () = futs.try_collect().await?;
 
         let conn = pool.get().await?;
 
@@ -284,18 +354,6 @@ mod tests {
             let timeout = Some(tokio::time::Duration::from_millis(5));
             let itx = InterruptibleTransaction::new(tx, timeout, "test_interruptible_transaction");
             let res = itx.execute("INSERT INTO testsbool (id) WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 100000000  ) SELECT id FROM cte;", &[]);
-
-            assert!(res.is_err_and(
-                |e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
-            ));
-        }
-
-        {
-            let tx = conn.transaction()?;
-            let timeout = Some(tokio::time::Duration::from_millis(5));
-            let itx = InterruptibleTransaction::new(tx, timeout, "test_interruptible_transaction");
-            let res = itx.prepare_cached("INSERT INTO testsbool (id) WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 100000000  ) SELECT id FROM cte;")?
-                        .execute(());
 
             assert!(res.is_err_and(
                 |e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)

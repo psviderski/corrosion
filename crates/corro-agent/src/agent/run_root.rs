@@ -2,12 +2,14 @@
 
 use std::time::Instant;
 
+use crate::api::public::execute_schema;
 use crate::{
     agent::{
         handlers::{self, spawn_handle_db_maintenance},
         metrics, setup, util, AgentOptions,
     },
     broadcast::runtime_loop,
+    transport::Transport,
 };
 use corro_types::{
     actor::ActorId,
@@ -19,6 +21,7 @@ use corro_types::{
 
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use spawn::spawn_counted;
+use tokio::task::JoinHandle;
 use tracing::{error, info};
 use tripwire::Tripwire;
 
@@ -26,26 +29,33 @@ use tripwire::Tripwire;
 ///
 /// First initialise `AgentOptions` state via `setup()`, then spawn a
 /// new task that runs the main agent state machine
-pub async fn start_with_config(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Bookie)> {
+pub async fn start_with_config(
+    conf: Config,
+    tripwire: Tripwire,
+) -> eyre::Result<(Agent, Bookie, Transport, Vec<JoinHandle<()>>)> {
     let (agent, opts) = setup(conf.clone(), tripwire.clone()).await?;
+    let transport = opts.transport.clone();
 
-    let bookie = run(agent.clone(), opts, conf.perf).await?;
+    let (bookie, handles) = run(agent.clone(), opts, conf.perf).await?;
 
-    Ok((agent, bookie))
+    Ok((agent, bookie, transport, handles))
 }
 
-async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Result<Bookie> {
+async fn run(
+    agent: Agent,
+    opts: AgentOptions,
+    pconf: PerfConfig,
+) -> eyre::Result<(Bookie, Vec<JoinHandle<()>>)> {
     let AgentOptions {
         gossip_server_endpoint,
         transport,
         api_listeners,
-        tripwire,
+        mut tripwire,
         lock_registry,
         rx_bcast,
         rx_apply,
         rx_clear_buf,
         rx_changes,
-        rx_emptyset,
         rx_foca,
         subs_manager,
         subs_bcast_cache,
@@ -58,23 +68,27 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
 
     //// Start PG server to accept query requests from PG clients
     // TODO: pull this out into a separate function?
-    if let Some(pg_conf) = agent.config().api.pg.clone() {
+    if let Some(pg_confs) = agent.config().api.pg.clone() {
         info!("Starting PostgreSQL wire-compatible server");
-        let pg_server = corro_pg::start(agent.clone(), pg_conf, tripwire.clone()).await?;
-        info!(
-            "Started PostgreSQL wire-compatible server, listening at {}",
-            pg_server.local_addr
-        );
+        for pg_conf in pg_confs {
+            let pg_server = corro_pg::start(agent.clone(), pg_conf, tripwire.clone()).await?;
+            info!(
+                "Started PostgreSQL wire-compatible server, listening at {}",
+                pg_server.local_addr
+            );
+        }
     }
 
     let (to_send_tx, to_send_rx) = bounded(pconf.to_send_channel_len, "to_send");
     let (notifications_tx, notifications_rx) =
         bounded(pconf.notifications_channel_len, "notifications");
 
+    let member_states = util::load_member_states(&agent).await;
+
     //// Start the main SWIM runtime loop
     runtime_loop(
         // here the agent already has the current cluster_id, we don't need to pass one
-        agent.actor(None),
+        agent.actor(None, agent.config().gossip.member_id),
         agent.clone(),
         transport.clone(),
         rx_foca,
@@ -82,37 +96,58 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         to_send_tx,
         notifications_tx,
         tripwire.clone(),
+        member_states.clone(),
     );
 
     //// Update member connection RTTs
-    handlers::spawn_rtt_handler(&agent, rtt_rx);
+    handlers::spawn_rtt_handler(&agent, rtt_rx, tripwire.clone());
 
     handlers::spawn_swim_announcer(&agent, gossip_addr, tripwire.clone());
 
     // Load existing cluster members into the SWIM runtime
-    util::initialise_foca(&agent).await;
+    util::initialise_foca(&agent, member_states).await;
 
+    // Load schema from paths
+    let stmts = corro_utils::read_files_from_paths(&agent.config().db.schema_paths).await?;
+    if !stmts.is_empty() {
+        if let Err(e) = execute_schema(&agent, stmts).await {
+            error!("could not execute schema: {e}");
+        }
+    }
+
+    let mut handles = vec![];
     // Setup client http API
-    util::setup_http_api_handler(
+    let mut http_handles = util::setup_http_api_handler(
         &agent,
-        &tripwire,
+        &mut tripwire,
         subs_bcast_cache,
         updates_bcast_cache,
         &subs_manager,
         api_listeners,
     )
     .await?;
+    handles.append(&mut http_handles);
 
-    tokio::spawn(util::clear_buffered_meta_loop(agent.clone(), rx_clear_buf));
+    spawn_counted(util::clear_buffered_meta_loop(
+        agent.clone(),
+        rx_clear_buf,
+        tripwire.clone(),
+    ));
 
-    tokio::spawn(metrics::metrics_loop(agent.clone(), transport.clone()));
-    tokio::spawn(handlers::handle_gossip_to_send(
+    spawn_counted(metrics::metrics_loop(
+        agent.clone(),
+        transport.clone(),
+        tripwire.clone(),
+    ));
+    spawn_counted(handlers::handle_gossip_to_send(
         transport.clone(),
         to_send_rx,
+        tripwire.clone(),
     ));
-    tokio::spawn(handlers::handle_notifications(
+    spawn_counted(handlers::handle_notifications(
         agent.clone(),
         notifications_rx,
+        tripwire.clone(),
     ));
 
     spawn_handle_db_maintenance(&agent);
@@ -126,8 +161,13 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     let start = Instant::now();
     {
         let conn = agent.pool().read().await?;
+        // check __corro_seq_bookkeeping for any actor ids that we only have partial changes for.
         let actor_ids: Vec<ActorId> = conn
-            .prepare("SELECT site_id FROM crsql_site_id WHERE ordinal > 0")?
+            .prepare(
+                "SELECT site_id FROM crsql_site_id WHERE ordinal > 0
+                        UNION
+                    SELECT distinct site_id FROM __corro_seq_bookkeeping",
+            )?
             .query_map([], |row| row.get(0))
             .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
 
@@ -210,15 +250,11 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     //// future tree spawns additional message type sub-handlers
     handlers::spawn_gossipserver_handler(&agent, &bookie, &tripwire, gossip_server_endpoint);
 
-    spawn_counted(
+    let changes_handle = spawn_counted(
         handlers::handle_changes(agent.clone(), bookie.clone(), rx_changes, tripwire.clone())
             .inspect(|_| info!("corrosion handle changes loop is done")),
     );
+    handles.push(changes_handle);
 
-    spawn_counted(
-        handlers::handle_emptyset(agent.clone(), bookie.clone(), rx_emptyset, tripwire.clone())
-            .inspect(|_| info!("corrosion handle emptyset loop is done")),
-    );
-
-    Ok(bookie)
+    Ok((bookie, handles))
 }

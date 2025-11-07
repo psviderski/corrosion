@@ -24,7 +24,6 @@ steps:
       - "builds/*.tar.gz"
     agents:
       queue: "high-concurrency"
-    depends_on: [lint]
 
   - label: "☁️ Upload"
     priority: 50

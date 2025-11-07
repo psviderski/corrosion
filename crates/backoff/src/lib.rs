@@ -1,6 +1,6 @@
 use std::{iter, time};
 
-use rand::{thread_rng, Rng};
+use rand::{rng, Rng};
 
 /// Exponential backoff.
 #[derive(Debug, Clone)]
@@ -36,13 +36,12 @@ impl Backoff {
     /// Set the amount of jitter per backoff.
     ///
     /// ## Panics
-    /// This method panics if a number smaller than `0` or larger than `1` is
-    /// provided.
+    /// This method panics if jitter <= 0 or jitter >= 1
     #[inline]
     pub fn jitter(mut self, jitter: f32) -> Self {
         assert!(
             jitter > 0f32 && jitter < 1f32,
-            "<exponential-backoff>: jitter must be between 0 and 1."
+            "<exponential-backoff>: jitter must be greater than 0 and less than 1."
         );
         self.jitter = jitter;
         self
@@ -107,7 +106,7 @@ impl iter::Iterator for Iter {
 
         // Apply jitter. Uses multiples of 100 to prevent relying on floats.
         let jitter_factor = (self.inner.jitter * 100f32) as u32;
-        let random: u32 = thread_rng().gen_range(0..(jitter_factor * 2));
+        let random: u32 = rng().random_range(0..(jitter_factor * 2));
         duration *= 100;
         if random < jitter_factor {
             let jitter = (duration * random) / 100;

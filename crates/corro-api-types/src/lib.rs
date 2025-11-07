@@ -48,7 +48,7 @@ impl<T> TypedQueryEvent<T> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum QueryEventMeta {
     Columns,
     Row(RowId),
@@ -220,6 +220,7 @@ pub struct ExecResponse {
     pub results: Vec<ExecResult>,
     pub time: f64,
     pub version: Option<u64>,
+    pub actor_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -389,6 +390,24 @@ impl From<i64> for SqliteParam {
     }
 }
 
+impl From<i32> for SqliteParam {
+    fn from(value: i32) -> Self {
+        Self::Integer(value.into())
+    }
+}
+
+impl From<SqliteValue> for SqliteParam {
+    fn from(value: SqliteValue) -> Self {
+        match value {
+            SqliteValue::Null => Self::Null,
+            SqliteValue::Integer(i) => Self::Integer(i),
+            SqliteValue::Real(f) => Self::Real(*f),
+            SqliteValue::Text(t) => Self::Text(t),
+            SqliteValue::Blob(b) => Self::Blob(b),
+        }
+    }
+}
+
 impl ToSql for SqliteParam {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         Ok(match self {
@@ -510,7 +529,7 @@ impl SqliteValue {
         }
     }
 
-    pub fn as_ref(&self) -> SqliteValueRef {
+    pub fn as_ref(&self) -> SqliteValueRef<'_> {
         match self {
             SqliteValue::Null => SqliteValueRef(ValueRef::Null),
             SqliteValue::Integer(i) => SqliteValueRef(ValueRef::Integer(*i)),
@@ -564,6 +583,18 @@ impl From<i64> for SqliteValue {
 impl From<f64> for SqliteValue {
     fn from(value: f64) -> Self {
         Self::Real(Real(value))
+    }
+}
+
+impl From<&SqliteValue> for SqliteValue {
+    fn from(value: &SqliteValue) -> Self {
+        value.clone()
+    }
+}
+
+impl From<&&SqliteValue> for SqliteValue {
+    fn from(value: &&SqliteValue) -> Self {
+        (*value).clone()
     }
 }
 

@@ -18,6 +18,7 @@ use uhlc::NTP64;
 use uuid::Uuid;
 
 use crate::broadcast::Timestamp;
+use crate::members::MemberState;
 
 #[derive(
     Debug, Default, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize,
@@ -137,6 +138,8 @@ pub struct Actor {
     ts: Timestamp,
     #[serde(default)]
     cluster_id: ClusterId,
+    #[serde(default)]
+    member_id: Option<MemberId>,
 }
 
 impl Hash for Actor {
@@ -147,12 +150,19 @@ impl Hash for Actor {
 }
 
 impl Actor {
-    pub fn new(id: ActorId, addr: SocketAddr, ts: Timestamp, cluster_id: ClusterId) -> Self {
+    pub fn new(
+        id: ActorId,
+        addr: SocketAddr,
+        ts: Timestamp,
+        cluster_id: ClusterId,
+        member_id: Option<MemberId>,
+    ) -> Self {
         Self {
             id,
             addr,
             ts,
             cluster_id,
+            member_id,
         }
     }
 
@@ -168,6 +178,13 @@ impl Actor {
     pub fn cluster_id(&self) -> ClusterId {
         self.cluster_id
     }
+    pub fn member_id(&self) -> Option<MemberId> {
+        self.member_id
+    }
+
+    pub fn to_state(&self) -> MemberState {
+        MemberState::new(self.addr, self.ts, self.cluster_id, self.member_id)
+    }
 }
 
 impl From<SocketAddr> for Actor {
@@ -177,22 +194,39 @@ impl From<SocketAddr> for Actor {
             value,
             Timestamp::zero(),
             Default::default(),
+            None,
         )
     }
 }
 
+pub struct ActorAddr {
+    id: ActorId,
+    addr: SocketAddr,
+}
+
+impl PartialEq for ActorAddr {
+    fn eq(&self, other: &Self) -> bool {
+        // this happens if we're announcing ourselves to another node
+        // we don't yet have any info about them, except their gossip addr
+        if self.id.is_nil() || other.id.is_nil() {
+            self.addr.eq(&other.addr)
+        } else {
+            self.id.eq(&other.id)
+        }
+    }
+}
+
 impl Identity for Actor {
+    type Addr = ActorAddr;
+
     // Since a client outside the cluster will not be aware of our
     // `bump` field, we implement the optional trait method
     // `has_same_prefix` to allow anyone that knows our `addr`
     // to join our cluster.
-    fn has_same_prefix(&self, other: &Self) -> bool {
-        // this happens if we're announcing ourselves to another node
-        // we don't yet have any info about them, except their gossip addr
-        if other.id.is_nil() || self.id.is_nil() {
-            self.addr.eq(&other.addr)
-        } else {
-            self.id.eq(&other.id)
+    fn addr(&self) -> Self::Addr {
+        ActorAddr {
+            id: self.id,
+            addr: self.addr,
         }
     }
 
@@ -205,7 +239,12 @@ impl Identity for Actor {
             addr: self.addr,
             ts: NTP64::from(duration_since_epoch()).into(),
             cluster_id: self.cluster_id,
+            member_id: self.member_id,
         })
+    }
+
+    fn win_addr_conflict(&self, adversary: &Self) -> bool {
+        self.ts > adversary.ts
     }
 }
 
@@ -264,6 +303,60 @@ impl ToSql for ClusterId {
 }
 
 impl FromSql for ClusterId {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        Ok(Self(FromSql::column_result(value)?))
+    }
+}
+
+#[derive(
+    Debug, Default, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize,
+)]
+#[serde(transparent)]
+pub struct MemberId(pub u16);
+
+impl fmt::Display for MemberId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl<'a, C> Readable<'a, C> for MemberId
+where
+    C: Context,
+{
+    #[inline]
+    fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
+        Ok(MemberId(u16::read_from(reader)?))
+    }
+
+    #[inline]
+    fn minimum_bytes_needed() -> usize {
+        2
+    }
+}
+
+impl<C> Writable<C> for MemberId
+where
+    C: Context,
+{
+    #[inline]
+    fn write_to<T: ?Sized + Writer<C>>(&self, writer: &mut T) -> Result<(), C::Error> {
+        self.0.write_to(writer)
+    }
+
+    #[inline]
+    fn bytes_needed(&self) -> Result<usize, C::Error> {
+        Writable::<C>::bytes_needed(&self.0)
+    }
+}
+
+impl ToSql for MemberId {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.0.to_sql()
+    }
+}
+
+impl FromSql for MemberId {
     fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
         Ok(Self(FromSql::column_result(value)?))
     }

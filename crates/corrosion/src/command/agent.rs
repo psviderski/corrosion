@@ -1,19 +1,30 @@
 use std::{net::SocketAddr, time::Duration};
 
+use antithesis_sdk::prelude::*;
 use build_info::VersionControl;
 use camino::Utf8PathBuf;
-use corro_admin::AdminConfig;
-use corro_types::config::{Config, PrometheusConfig};
+use corro_admin::{AdminConfig, TracingHandle};
+use corro_types::{
+    config::{Config, PrometheusConfig},
+    gauge::PERSISTENT_GAUGE_REGISTRY,
+    persistent_gauge,
+};
 use metrics::gauge;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use metrics_util::MetricKindMask;
 use spawn::wait_for_all_pending_handles;
 use tokio_metrics::RuntimeMonitor;
 use tracing::{error, info};
+// use tracing_filter::{legacy::Filter, FilterLayer};
+// use tracing_subscriber::{reload::Handle, Registry};
 
 use crate::VERSION;
 
-pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> {
+pub async fn run(
+    config: Config,
+    config_path: &Utf8PathBuf,
+    tracing_handle: Option<TracingHandle>,
+) -> eyre::Result<()> {
     info!("Starting Corrosion Agent v{VERSION}");
 
     if let Some(PrometheusConfig { bind_addr }) = config.telemetry.prometheus {
@@ -30,32 +41,28 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
             (unknown.clone(), unknown.clone())
         };
 
-        // required because gauges are subject to a idle timeout, so we need to touch this frequently
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
+        persistent_gauge!(
+            "corro.build.info",
+            "version" => info.crate_info.version.to_string(),
+            "ts" => info.timestamp.to_string(),
+            "rustc_version" => info.compiler.version.to_string(),
+            "git_commit" => git_commit.clone(),
+            "git_branch" => git_branch.clone()
+        )
+        .set(1.0);
 
-                gauge!(
-                    "corro.build.info",
-                    "version" => info.crate_info.version.to_string(),
-                    "ts" => info.timestamp.to_string(),
-                    "rustc_version" => info.compiler.version.to_string(),
-                    "git_commit" => git_commit.clone(),
-                    "git_branch" => git_branch.clone(),
-                )
-                .set(1.0);
-            }
-        });
+        // Ensure all persistent gauges get touched every 30s
+        PERSISTENT_GAUGE_REGISTRY.clone().spawn_handle_update();
 
         start_tokio_runtime_reporter();
     }
 
     let (tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
 
-    let (agent, bookie) = corro_agent::agent::start_with_config(config.clone(), tripwire.clone())
-        .await
-        .expect("could not start agent");
+    let (agent, bookie, _, handles) =
+        corro_agent::agent::start_with_config(config.clone(), tripwire.clone())
+            .await
+            .expect("could not start agent");
 
     corro_admin::start_server(
         agent.clone(),
@@ -64,11 +71,12 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
             listen_path: config.admin.uds_path.clone(),
             config_path: config_path.clone(),
         },
+        tracing_handle,
         tripwire,
     )?;
 
     if !config.db.schema_paths.is_empty() {
-        let client = corro_client::CorrosionApiClient::new(*config.api.bind_addr.first().unwrap());
+        let client = corro_client::CorrosionApiClient::new(*config.api.bind_addr.first().unwrap())?;
         match client
             .schema_from_paths(config.db.schema_paths.as_slice())
             .await
@@ -85,7 +93,17 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
         }
     }
 
+    antithesis_init();
     tripwire_worker.await;
+
+    // wait for handles to finish
+    for handle in handles {
+        if let Err(e) = handle.await {
+            error!("error from task handle: {e:?}");
+        }
+    }
+    // wind down subs when handles are dropped
+    agent.subs_manager().drop_handles().await;
 
     wait_for_all_pending_handles().await;
 
