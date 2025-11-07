@@ -1215,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "corrosion"
-version = "0.2.2"
+version = "2025.11.4"
 dependencies = [
  "antithesis_sdk",
  "build-info",
