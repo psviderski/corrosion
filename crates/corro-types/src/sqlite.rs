@@ -1,22 +1,196 @@
 use std::{
+    collections::HashMap,
     ops::{Deref, DerefMut},
     time::{Duration, Instant},
 };
 
+use metrics::counter;
 use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use rusqlite::types::{ToSql, ToSqlOutput, Value};
 use rusqlite::{
-    params, trace::TraceEventCodes, vtab::eponymous_only_module, Connection, Transaction,
+    params, trace::TraceEventCodes, vtab::eponymous_only_module, Connection, Transaction, MAIN_DB,
 };
-use sqlite_pool::{Committable, SqliteConn};
+use sqlite_pool::SqliteConn;
 use std::rc::Rc;
 use tempfile::TempDir;
+use thread_local::ThreadLocal;
 use tracing::{error, info, trace, warn};
+use tripwire::Tripwire;
 
 use crate::vtab::unnest::UnnestTab;
 
 pub type SqlitePool = sqlite_pool::Pool<CrConn>;
 pub type SqlitePoolError = sqlite_pool::PoolError;
+
+// Global registry for query stats
+// (sql, readonly) => (total_count, total_nanos)
+type QueryStats = HashMap<(String, bool), (u64, u128)>;
+type InFlightQueries = HashMap<String, Instant>;
+static QUERY_STATS: ThreadLocal<Mutex<QueryStats>> = ThreadLocal::new();
+pub static IN_FLIGHT_QUERIES: ThreadLocal<Mutex<InFlightQueries>> = ThreadLocal::new();
+
+pub async fn query_metrics_loop(mut tripwire: Tripwire) {
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    let mut prev_tick = interval.tick().await;
+    loop {
+        tokio::select! {
+        t = interval.tick() => {
+            let elapsed = t.duration_since(prev_tick);
+            prev_tick = t;
+            handle_query_metrics(elapsed);
+            },
+            _ = &mut tripwire => break,
+        }
+    }
+}
+
+// Log to stdout queries taking more than 1 second
+const SLOW_QUERY_THRESHOLD: Duration = Duration::from_secs(1);
+// Send utilization metrics for queries taking more than 10ms per second on average
+const IMPACTFUL_QUERY_THRESHOLD_MS_PER_SECOND: f64 = 10.0;
+// The default length in prometheus is 4kb but 1kb is more than enough
+const MAX_QUERY_LABEL_LENGTH: usize = 1024;
+fn handle_query_metrics(elapsed: Duration) {
+    // Aggregate and drain stats from all threads into a single map
+    let mut aggregated: QueryStats = Default::default();
+
+    for stats_mutex in QUERY_STATS.iter() {
+        let mut stats = stats_mutex.lock();
+        for (key, (count, nanos)) in stats.drain() {
+            let entry = aggregated.entry(key).or_insert((0u64, 0u128));
+            entry.0 += count;
+            entry.1 += nanos;
+        }
+    }
+
+    let mut other_ro_queries_count = 0u64;
+    let mut other_ro_queries_nanos = 0u128;
+    let mut other_rw_queries_count = 0u64;
+    let mut other_rw_queries_nanos = 0u128;
+    for ((query_raw, readonly), (total_query_count, total_query_nanos)) in aggregated.into_iter() {
+        let total_query_ms = (total_query_nanos / 1_000_000) as u64;
+        let ms_per_second = total_query_ms as f64 / elapsed.as_secs_f64();
+        if ms_per_second > IMPACTFUL_QUERY_THRESHOLD_MS_PER_SECOND {
+            // For too long queries, truncate them to cap the label length
+            // and append a hash to avoid collisions
+            let query = if query_raw.len() > MAX_QUERY_LABEL_LENGTH {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::Hash;
+                use std::hash::Hasher;
+                let mut h = DefaultHasher::new();
+                query_raw.hash(&mut h);
+                format!(
+                    "{}_{:x}",
+                    query_raw.chars().take(1024 - 16 - 1).collect::<String>(),
+                    h.finish()
+                )
+            } else {
+                query_raw.clone()
+            };
+            counter!("corro.db.query.ms", "query" => query.clone() , "readonly" => readonly.to_string()).increment(total_query_ms);
+            counter!("corro.db.query.count", "query" => query.clone(), "readonly" => readonly.to_string()).increment(total_query_count);
+        } else {
+            // For all other queries let's just sum them up
+            if readonly {
+                other_ro_queries_count += total_query_count;
+                other_ro_queries_nanos += total_query_nanos;
+            } else {
+                other_rw_queries_count += total_query_count;
+                other_rw_queries_nanos += total_query_nanos;
+            }
+        }
+    }
+    let other_queries_name = "OTHER";
+    let other_ro_queries_ms = (other_ro_queries_nanos / 1_000_000) as u64;
+    counter!("corro.db.query.ms", "query" => other_queries_name , "readonly" => "true")
+        .increment(other_ro_queries_ms);
+    counter!("corro.db.query.count", "query" => other_queries_name, "readonly" => "true")
+        .increment(other_ro_queries_count);
+    let other_rw_queries_ms = (other_rw_queries_nanos / 1_000_000) as u64;
+    counter!("corro.db.query.ms", "query" => other_queries_name , "readonly" => "false")
+        .increment(other_rw_queries_ms);
+    counter!("corro.db.query.count", "query" => other_queries_name, "readonly" => "false")
+        .increment(other_rw_queries_count);
+}
+
+fn tracing_callback_ro(ev: rusqlite::trace::TraceEvent) {
+    handle_sql_tracing_event(ev, true);
+}
+
+fn tracing_callback_rw(ev: rusqlite::trace::TraceEvent) {
+    handle_sql_tracing_event(ev, false);
+}
+
+fn handle_sql_tracing_event(ev: rusqlite::trace::TraceEvent, readonly: bool) {
+    match ev {
+        rusqlite::trace::TraceEvent::Profile(stmt_ref, duration) => {
+            let dur = duration.as_nanos();
+            let sql = stmt_ref.sql().to_string();
+
+            // Update per-thread stats to avoid contention on hot path
+            let stats_mutex = QUERY_STATS.get_or_default();
+            let mut stats = stats_mutex.lock();
+            let entry = stats
+                .entry((sql.clone(), readonly))
+                .or_insert((0u64, 0u128));
+            entry.0 += 1;
+            entry.1 += dur;
+            drop(stats); // Release lock quickly
+
+            let queries_mu = IN_FLIGHT_QUERIES.get_or_default();
+            let mut inflight_queries = queries_mu.lock();
+            inflight_queries.remove(&sql);
+            drop(inflight_queries);
+
+            if duration >= SLOW_QUERY_THRESHOLD {
+                warn!(
+                    "SLOW {} query {duration:?} => {}",
+                    if readonly { "RO" } else { "RW" },
+                    sql
+                );
+            }
+        }
+        rusqlite::trace::TraceEvent::Stmt(_, sql) => {
+            // skip trigger for subprograms.
+            if sql.starts_with("--") {
+                return;
+            }
+            let start_time = Instant::now();
+            let queries_mu = IN_FLIGHT_QUERIES.get_or_default();
+            let mut inflight_queries = queries_mu.lock();
+            inflight_queries.insert(sql.to_string(), start_time);
+        }
+        _ => {}
+    }
+}
+
+pub fn log_slow_inflight_queries() {
+    let mut aggregated = HashMap::new();
+    for queries_mu in IN_FLIGHT_QUERIES.iter() {
+        let inflight_queries = queries_mu.lock().clone();
+        aggregated.extend(inflight_queries.into_iter());
+    }
+    aggregated.iter().for_each(|(sql, start_time)| {
+        let elapsed = start_time.elapsed();
+        if elapsed > SLOW_QUERY_THRESHOLD {
+            warn!("SLOW in-progress query: {sql} - time since start: {elapsed:?}");
+        }
+    });
+}
+
+pub fn trace_heavy_queries(conn: &Connection) -> rusqlite::Result<()> {
+    let readonly = conn.is_readonly(MAIN_DB)?;
+    conn.trace_v2(
+        TraceEventCodes::SQLITE_TRACE_PROFILE | TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(if readonly {
+            tracing_callback_ro
+        } else {
+            tracing_callback_rw
+        }),
+    );
+    Ok(())
+}
 
 const CRSQL_EXT_GENERIC_NAME: &str = "crsqlite";
 
@@ -42,46 +216,29 @@ static CRSQL_EXT_DIR: Lazy<TempDir> = Lazy::new(|| {
     dir
 });
 
-pub fn rusqlite_to_crsqlite_write(conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
+pub fn rusqlite_to_crsqlite_write(
+    conn: rusqlite::Connection,
+    cache_size_kib: i64,
+) -> rusqlite::Result<CrConn> {
     let conn = rusqlite_to_crsqlite(conn)?;
-    conn.execute_batch("PRAGMA cache_size = -32000;")?;
+    conn.execute_batch(&format!(
+        "
+        PRAGMA cache_size = {};
+        PRAGMA temp_store = MEMORY;
+        PRAGMA cache_spill = FALSE;
+        ",
+        cache_size_kib
+    ))?;
 
     Ok(conn)
 }
-
-// Due to an unknown bug, when this query get's prepared inside process_single_change_loop
-// It sometimes decides to not return any rows, even though it should
-// By preparing it when initializing the connection, it just works.
-pub const INSERT_CRSQL_CHANGES_QUERY: &str = r#"
-    INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
-        SELECT value0, value1, value2, value3, value4, value5, value6, value7, value8, value9
-        FROM unnest(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        -- WARNING: This returns a row BEFORE inserting not after
-        RETURNING db_version, seq, last_insert_rowid()
-    "#;
 
 pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
     init_cr_conn(&mut conn)?;
     setup_conn(&conn)?;
     sqlite_functions::add_to_connection(&conn)?;
 
-    // Prepare problematic queries here to avoid issues
-    // DON'T TOUCH IT, There are many dragons to tackle if u remove it
-    // If we don't prepare it here, there's a chance invalid VDBE will get generated
-    // I spent too much time debugging, it looks like a real bug in sqlite .-.
-    let _ = conn.prepare_cached(INSERT_CRSQL_CHANGES_QUERY)?;
-
-    const SLOW_THRESHOLD: Duration = Duration::from_secs(1);
-    conn.trace_v2(
-        TraceEventCodes::SQLITE_TRACE_PROFILE,
-        Some(|event| {
-            if let rusqlite::trace::TraceEvent::Profile(stmt_ref, duration) = event {
-                if duration >= SLOW_THRESHOLD {
-                    warn!("SLOW query {duration:?} => {}", stmt_ref.sql());
-                }
-            }
-        }),
-    );
+    trace_heavy_queries(&conn)?;
 
     Ok(CrConn(conn))
 }
@@ -129,18 +286,6 @@ impl Drop for CrConn {
     }
 }
 
-impl Committable for CrConn {
-    fn commit(self) -> Result<(), rusqlite::Error> {
-        Ok(())
-    }
-
-    fn savepoint(&mut self) -> Result<rusqlite::Savepoint<'_>, rusqlite::Error> {
-        Err(rusqlite::Error::ModuleError(String::from(
-            "cannot create savepoint from connection",
-        )))
-    }
-}
-
 fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     let ext_dir = &CRSQL_EXT_DIR;
     trace!(
@@ -177,6 +322,7 @@ pub fn setup_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     // Register unnest for PostgreSQL-style multi-array unnesting
     conn.create_module("unnest", eponymous_only_module::<UnnestTab>(), None)?;
+    conn.create_module("corro_unnest", eponymous_only_module::<UnnestTab>(), None)?;
 
     Ok(())
 }

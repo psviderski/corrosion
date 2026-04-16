@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 
 use crate::actor::MemberId;
@@ -13,8 +14,28 @@ pub const DEFAULT_MAX_SYNC_BACKOFF: u32 = 2;
 #[cfg(not(test))]
 pub const DEFAULT_MAX_SYNC_BACKOFF: u32 = 15;
 
-const fn default_apply_queue() -> usize {
+const fn default_apply_batch_min() -> usize {
     100
+}
+
+const fn default_apply_batch_step() -> usize {
+    500
+}
+
+const fn default_apply_batch_max() -> usize {
+    16_000
+}
+
+const fn default_batch_threshold_ratio() -> f64 {
+    0.9
+}
+
+const fn default_cache_size_kib() -> i64 {
+    -1048576 // 1 GB (negative value means KiB)
+}
+
+const fn default_reaper_interval() -> usize {
+    3600
 }
 
 const fn default_wal_threshold() -> usize {
@@ -79,6 +100,8 @@ pub struct Config {
     pub log: LogConfig,
     #[serde(default)]
     pub consul: Option<ConsulConfig>,
+    #[serde(default)]
+    pub reaper: Option<ReaperConfig>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -122,6 +145,11 @@ pub struct DbConfig {
     pub schema_paths: Vec<Utf8PathBuf>,
     #[serde(default)]
     pub subscriptions_path: Option<Utf8PathBuf>,
+    /// SQLite page cache size in KiB for writes (negative value).
+    /// Default: -1048576 (1 GB). Larger values improve write performance but use more RAM.
+    /// WARNING: Setting this too low (<100MB) can severely degrade performance.
+    #[serde(default = "default_cache_size_kib")]
+    pub cache_size_kib: i64,
 }
 
 impl DbConfig {
@@ -144,6 +172,8 @@ pub struct ApiConfig {
     #[serde(alias = "addr")]
     #[serde_as(deserialize_as = "OneOrMany<_, PreferOne>")]
     pub bind_addr: Vec<SocketAddr>,
+    #[serde(default)]
+    pub endpoint_name: Option<String>,
     #[serde(alias = "authz", default)]
     pub authorization: Option<AuthzConfig>,
     #[serde_as(deserialize_as = "Option<OneOrMany<_, PreferOne>>")]
@@ -220,20 +250,34 @@ pub struct PerfConfig {
     pub bcast_channel_len: usize,
     #[serde(default = "default_small_channel")]
     pub foca_channel_len: usize,
-    #[serde(default = "default_apply_timeout")]
-    pub apply_queue_timeout: usize,
-    #[serde(default = "default_apply_queue")]
-    pub apply_queue_len: usize,
     #[serde(default = "default_wal_threshold")]
     pub wal_threshold_mb: usize,
-    #[serde(default = "default_processing_queue")]
-    pub processing_queue_len: usize,
     #[serde(default = "default_sql_tx_timeout")]
     pub sql_tx_timeout: usize,
     #[serde(default = "default_min_sync_backoff")]
     pub min_sync_backoff: u32,
     #[serde(default = "default_max_sync_backoff")]
     pub max_sync_backoff: u32,
+    // How many unapplied changesets corrosion will buffer before starting to drop them
+    #[serde(default = "default_processing_queue")]
+    pub processing_queue_len: usize,
+    // How many ms corrosion will wait before proceeding to apply a batch of changes
+    // We wait either for apply_queue_timeout or untill at least apply_queue_min_batch_size changes accumulate
+    #[serde(default = "default_apply_timeout")]
+    pub apply_queue_timeout: usize,
+    // Minimum amount of changes corrosion will try to apply at once in the same transaction
+    #[serde(default = "default_apply_batch_min")]
+    pub apply_queue_min_batch_size: usize,
+    // batch_size = clamp(min_batch_size, step_base * 2 ** floor(log2(x/step_base)), max_batch_size)
+    #[serde(default = "default_apply_batch_step")]
+    pub apply_queue_step_base: usize,
+    // Maximum amount of changes corrosion will try to apply at once in the same transaction
+    #[serde(default = "default_apply_batch_max")]
+    pub apply_queue_max_batch_size: usize,
+    // Threshold ratio (0.0-1.0) for immediate batch spawning when queue reaches this fraction of batch size
+    // It's used to decide whether to wait for more changes for apply_queue_timeout ms or spawn a batch immediately
+    #[serde(default = "default_batch_threshold_ratio")]
+    pub apply_queue_batch_threshold_ratio: f64,
 }
 
 impl Default for PerfConfig {
@@ -248,13 +292,16 @@ impl Default for PerfConfig {
             clearbuf_channel_len: default_mid_channel(),
             bcast_channel_len: default_mid_channel(),
             foca_channel_len: default_small_channel(),
-            apply_queue_timeout: default_apply_timeout(),
-            apply_queue_len: default_apply_queue(),
             wal_threshold_mb: default_wal_threshold(),
-            processing_queue_len: default_processing_queue(),
             sql_tx_timeout: default_sql_tx_timeout(),
             min_sync_backoff: default_min_sync_backoff(),
             max_sync_backoff: default_max_sync_backoff(),
+            processing_queue_len: default_processing_queue(),
+            apply_queue_timeout: default_apply_timeout(),
+            apply_queue_min_batch_size: default_apply_batch_min(),
+            apply_queue_step_base: default_apply_batch_step(),
+            apply_queue_max_batch_size: default_apply_batch_max(),
+            apply_queue_batch_threshold_ratio: default_batch_threshold_ratio(),
         }
     }
 }
@@ -317,6 +364,8 @@ fn default_as_true() -> bool {
 pub enum ConfigError {
     #[error(transparent)]
     Config(#[from] config::ConfigError),
+    #[error("gossip.max_mtu value {value} is below the QUIC minimum of 1200 (RFC 9000)")]
+    InvalidMaxMtu { value: u16 },
 }
 
 impl Config {
@@ -331,7 +380,17 @@ impl Config {
             .add_source(config::File::new(config_path, config::FileFormat::Toml))
             .add_source(config::Environment::default().separator("__"))
             .build()?;
-        Ok(config.try_deserialize()?)
+        let cfg: Self = config.try_deserialize()?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+    fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(mtu) = self.gossip.max_mtu {
+            if mtu < 1200 {
+                return Err(ConfigError::InvalidMaxMtu { value: mtu });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -340,6 +399,7 @@ pub struct ConfigBuilder {
     pub db_path: Option<Utf8PathBuf>,
     gossip_addr: Option<SocketAddr>,
     api_addr: Vec<SocketAddr>,
+    endpoint_name: Option<String>,
     external_addr: Option<SocketAddr>,
     admin_path: Option<Utf8PathBuf>,
     prometheus_addr: Option<SocketAddr>,
@@ -348,9 +408,12 @@ pub struct ConfigBuilder {
     schema_paths: Vec<Utf8PathBuf>,
     max_change_size: Option<i64>,
     consul: Option<ConsulConfig>,
+    reaper: Option<ReaperConfig>,
     tls: Option<TlsConfig>,
     perf: Option<PerfConfig>,
     member_id: Option<MemberId>,
+    max_mtu: Option<u16>,
+    disable_gso: bool,
 }
 
 impl ConfigBuilder {
@@ -366,6 +429,11 @@ impl ConfigBuilder {
 
     pub fn api_addr(mut self, addr: SocketAddr) -> Self {
         self.api_addr.push(addr);
+        self
+    }
+
+    pub fn endpoint_name<S: Into<String>>(mut self, endpoint_name: S) -> Self {
+        self.endpoint_name = Some(endpoint_name.into());
         self
     }
 
@@ -404,6 +472,11 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn reaper(mut self, config: ReaperConfig) -> Self {
+        self.reaper = Some(config);
+        self
+    }
+
     pub fn tls_config(mut self, config: TlsConfig) -> Self {
         self.tls = Some(config);
         self
@@ -411,6 +484,18 @@ impl ConfigBuilder {
 
     pub fn member_id(mut self, member_id: MemberId) -> Self {
         self.member_id = Some(member_id);
+        self
+    }
+
+    /// Set the maximum MTU for the QUIC gossip transport.
+    pub fn max_mtu(mut self, mtu: u16) -> Self {
+        self.max_mtu = Some(mtu);
+        self
+    }
+
+    /// Disable Generic Segmentation Offload (GSO) for the QUIC gossip transport.
+    pub fn disable_gso(mut self, disable: bool) -> Self {
+        self.disable_gso = disable;
         self
     }
 
@@ -433,9 +518,11 @@ impl ConfigBuilder {
                 path: db_path,
                 schema_paths: self.schema_paths,
                 subscriptions_path: None,
+                cache_size_kib: default_cache_size_kib(),
             },
             api: ApiConfig {
                 bind_addr: self.api_addr,
+                endpoint_name: self.endpoint_name,
                 authorization: None,
                 pg: None,
             },
@@ -449,8 +536,8 @@ impl ConfigBuilder {
                 plaintext: self.tls.is_none(),
                 tls: self.tls,
                 idle_timeout_secs: default_gossip_idle_timeout(),
-                max_mtu: None, // TODO: add a builder function for it
-                disable_gso: false,
+                max_mtu: self.max_mtu,
+                disable_gso: self.disable_gso,
                 member_id: self.member_id,
             },
             perf: self.perf.unwrap_or_default(),
@@ -461,6 +548,7 @@ impl ConfigBuilder {
             log: self.log.unwrap_or_default(),
 
             consul: self.consul,
+            reaper: self.reaper,
         })
     }
 }
@@ -489,4 +577,25 @@ pub enum LogFormat {
 #[serde(rename_all = "kebab-case")]
 pub struct ConsulConfig {
     pub client: consul_client::Config,
+}
+
+// ReaperConfig specifies tables and the duration after which clock and pk records for deleted
+// primary keys can be deleted (i.e data in <table>__crsql_pks and <table>__crsql_clock).
+// WARNING: Specifying table to be reaped can cause inconsistencies if old primary keys come back
+// after specified duration. Use with caution.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReaperConfig {
+    pub tables: HashMap<String, TableReapConfig>,
+    #[serde(default = "default_reaper_interval")]
+    pub check_interval: usize,
+}
+
+/// Per-table reaper config.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TableReapConfig {
+    pub retention: String,
+    /// Optional WHERE clause fragment (without "WHERE") to only delete pks
+    /// that match the filter e.g "id LIKE 'throwaway-%'"
+    #[serde(default)]
+    pub match_filter: Option<String>,
 }

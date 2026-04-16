@@ -7,14 +7,18 @@ use std::{
 
 use crate::api::utils::CountedBody;
 use antithesis_sdk::assert_sometimes;
-use axum::{extract::ConnectInfo, response::IntoResponse, Extension};
+use axum::{
+    extract::{ConnectInfo, Query},
+    response::IntoResponse,
+    Extension,
+};
 use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
     agent::{Agent, ChangeError},
     api::{
-        ColumnName, ExecResponse, ExecResult, QueryEvent, Statement, TableStatRequest,
-        TableStatResponse,
+        ColumnName, ExecResponse, ExecResult, HealthQuery, HealthResponse, QueryEvent, Statement,
+        TableStatRequest, TableStatResponse,
     },
     base::CrsqlDbVersion,
     broadcast::Timestamp,
@@ -28,7 +32,7 @@ use metrics::{counter, histogram};
 use rusqlite::{params_from_iter, ToSql, Transaction};
 use serde::Deserialize;
 use spawn::spawn_counted;
-use sqlite_pool::{Committable, InterruptibleTransaction};
+use sqlite_pool::{Committable, InterruptibleTransaction, SqliteConn};
 
 use tokio::{
     sync::{
@@ -37,7 +41,6 @@ use tokio::{
     },
     task::block_in_place,
 };
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use corro_types::broadcast::broadcast_changes;
@@ -60,22 +63,19 @@ pub async fn make_broadcastable_changes<F, T>(
 where
     F: FnOnce(&InterruptibleTransaction<Transaction>) -> Result<T, ChangeError>,
 {
+    let actor_id = agent.actor_id();
     trace!("getting conn...");
     let mut conn = agent.pool().write_priority().await?;
     trace!("got conn");
-
-    let actor_id = agent.actor_id();
-    // maybe we should do this earlier, but there can only ever be 1 write conn at a time,
-    // so it probably doesn't matter too much, except for reads of internal state
-    let mut book_writer = agent
-        .booked()
-        .write::<&str, _>("make_broadcastable_changes(booked writer)", None)
-        .await;
 
     let start = Instant::now();
     let ts = Timestamp::from(agent.clock().new_timestamp());
 
     block_in_place(move || {
+        trace!("acquiring bookie write lock...");
+        let bookie_write = agent.bookie().write_lock_blocking();
+        let mut book_writer = bookie_write.write_tx(agent.booked());
+
         let tx = conn
             .immediate_transaction()
             .map_err(|source| ChangeError::Rusqlite {
@@ -85,7 +85,7 @@ where
             })?;
 
         let timeout = timeout.map(Duration::from_secs);
-        let tx = InterruptibleTransaction::new(tx, timeout, "local_changes");
+        let tx = InterruptibleTransaction::new(tx, timeout, "query_endpoint");
 
         let _ = tx
             .prepare_cached("SELECT crsql_set_ts(?)")
@@ -121,11 +121,10 @@ where
                 db_version,
                 last_seq,
                 ts,
-                snap,
             }) => {
                 trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
-                book_writer.commit_snapshot(snap);
+                book_writer.commit();
 
                 let agent = agent.clone();
 
@@ -291,6 +290,12 @@ async fn build_query_rows_response(
             }
         };
 
+        // default timeout of 1 minute if no timeout is provided
+        let timeout_secs = timeout.unwrap_or(60);
+        let timeout: Option<Duration> =
+            (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
+
+        let conn = InterruptibleTransaction::new(conn.conn(), timeout, "query");
         trace!(%client_addr, "Preparing statement {}", stmt.query());
 
         let prepped_res = block_in_place(|| conn.prepare(stmt.query()));
@@ -318,31 +323,6 @@ async fn build_query_rows_response(
             return;
         }
 
-        let timeout = timeout.unwrap_or(4);
-        let timeout: Option<Duration> = if timeout > 0 {
-            Some(Duration::from_secs(timeout * 60))
-        } else {
-            None
-        };
-
-        let int_handle = conn.get_interrupt_handle();
-        let token = CancellationToken::new();
-        if let Some(timeout) = timeout {
-            let cloned_token = token.clone();
-            let stmt_query = stmt.query().to_string();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = cloned_token.cancelled() => {}
-                    _ = tokio::time::sleep(timeout) => {
-                        warn!("sql call took more than {timeout:?}, interrupting stmt- {:?}", stmt_query);
-                        int_handle.interrupt();
-                        counter!("corro.sqlite.interrupt", "source" => "timeout").increment(1);
-                    }
-                };
-            });
-        }
-
-        let _dropguard = token.drop_guard();
         block_in_place(|| {
             let col_count = prepped.column_count();
             trace!("inside block in place, col count: {col_count}");
@@ -643,6 +623,66 @@ pub async fn api_v1_db_schema(
     )
 }
 
+pub async fn api_v1_health(
+    Extension(agent): Extension<Agent>,
+    Query(query): Query<HealthQuery>,
+) -> (StatusCode, axum::Json<HealthResponse>) {
+    match check_health(&agent).await {
+        Ok((gaps, members)) => {
+            let p99_lag = agent.metrics_tracker().quantile_lag(0.99).unwrap_or(0.0);
+            let queue_size = agent.metrics_tracker().queue_size();
+            let status = if query.gaps.is_some_and(|max| gaps > max)
+                || query.max_queue.is_some_and(|max| queue_size > max)
+                // we use queue size and p99 lag as a stronger metric for an unhealthy node
+                // since a different node that is slow to send out changes can cause worse commit lag
+                // even though the node is perfectly fine.
+                || (query.p99_lag.is_some_and(|max| p99_lag > max)
+                    && query.queue_size.is_none_or(|max| queue_size > max))
+            {
+                let status = query.failure_status.unwrap_or(503);
+                StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+            } else {
+                StatusCode::OK
+            };
+            (
+                status,
+                axum::Json(HealthResponse::Response {
+                    gaps,
+                    members,
+                    p99_lag,
+                    queue_size,
+                }),
+            )
+        }
+        Err(e) => {
+            error!("could not check health: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(HealthResponse::Error(e.to_string())),
+            )
+        }
+    }
+}
+
+async fn check_health(agent: &Agent) -> eyre::Result<(i64, i64)> {
+    let read_conn = match agent.pool().read().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            error!("could not acquire read connection for health check: {e}");
+            return Err(eyre::eyre!("unable to grab write conn"));
+        }
+    };
+
+    let gaps = read_conn
+        .prepare_cached("SELECT COALESCE(SUM(end - start + 1), 0) FROM __corro_bookkeeping_gaps")?
+        .query_row([], |row| row.get::<_, i64>(0))?;
+
+    let members = read_conn.prepare_cached(r#"
+            SELECT COALESCE(COUNT(*), 0) FROM __corro_members WHERE json_extract(foca_state, "$.state") = "Alive""#)?
+        .query_row([], |row| row.get::<_, i64>(0))?;
+
+    Ok((gaps, members))
+}
 /// Query the table status of the current node
 ///
 /// Currently this endpoint only supports querying the row count for a
@@ -783,10 +823,7 @@ mod tests {
             }))
         ));
 
-        assert_eq!(
-            agent.booked().read::<&str, _>("test", None).await.last(),
-            Some(CrsqlDbVersion(1))
-        );
+        assert_eq!(agent.booked().read().last(), Some(CrsqlDbVersion(1)));
 
         println!("second req...");
 

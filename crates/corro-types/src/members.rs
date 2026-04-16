@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, net::SocketAddr, ops::Range, time::Duration};
 
 use circular_buffer::CircularBuffer;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 use crate::{
     actor::{Actor, ActorId, ClusterId, MemberId},
@@ -39,6 +39,10 @@ impl MemberState {
 
     pub fn is_ring0(&self) -> bool {
         self.ring == Some(0)
+    }
+
+    pub fn to_actor(&self, id: ActorId) -> Actor {
+        Actor::new(id, self.addr, self.ts, self.cluster_id, self.member_id)
     }
 }
 
@@ -90,6 +94,11 @@ impl Members {
         let mut ret = MemberAddedResult::Ignored;
 
         if actor.member_id() != self.member_id {
+            info!(
+                "Removing member, {actor_id:?} has member_id {:?} but and our member_id is {:?}",
+                actor.member_id(),
+                self.member_id
+            );
             let removed = self.states.remove(&actor_id).is_some();
             self.by_addr.remove(&actor.addr());
             return if removed {

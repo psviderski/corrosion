@@ -46,6 +46,87 @@ use corro_types::{
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn http_api_requested_endpoint_name_header_enforced() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let ta1 = launch_test_agent(
+        |conf| conf.endpoint_name("us-east-1").build(),
+        tripwire.clone(),
+    )
+    .await?;
+    let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+
+    let client = reqwest::Client::new();
+    let req_body_1: Vec<Statement> = serde_json::from_value(json!([[
+        "INSERT INTO tests (id,text) VALUES (?,?)",
+        [999_001, "endpoint header test 1"]
+    ]]))?;
+    let req_body_2: Vec<Statement> = serde_json::from_value(json!([[
+        "INSERT INTO tests (id,text) VALUES (?,?)",
+        [999_002, "endpoint header test 2"]
+    ]]))?;
+    let req_body_3: Vec<Statement> = serde_json::from_value(json!([[
+        "INSERT INTO tests (id,text) VALUES (?,?)",
+        [999_003, "endpoint header test 3"]
+    ]]))?;
+    let req_body_4: Vec<Statement> = serde_json::from_value(json!([[
+        "INSERT INTO tests (id,text) VALUES (?,?)",
+        [999_004, "endpoint header test 4"]
+    ]]))?;
+
+    // No X-Corrosion-Requested-Endpoint-Name: accept all requests
+    let no_header_res = client
+        .post(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&req_body_1)?)
+        .send()
+        .await?;
+    assert_eq!(no_header_res.status(), StatusCode::OK);
+
+    // w/ X-Corrosion-Requested-Endpoint-Name, matching
+    let matching_header_res = client
+        .post(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header("x-corrosion-requested-endpoint-name", "us-east-1")
+        .body(serde_json::to_vec(&req_body_2)?)
+        .send()
+        .await?;
+    assert_eq!(matching_header_res.status(), StatusCode::OK);
+
+    // w/ X-Corrosion-Requested-Endpoint-Name, mismatching
+    let mismatched_header_res = client
+        .post(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header("x-corrosion-requested-endpoint-name", "eu-west-1")
+        .body(serde_json::to_vec(&req_body_3)?)
+        .send()
+        .await?;
+    assert_eq!(
+        mismatched_header_res.status(),
+        StatusCode::MISDIRECTED_REQUEST
+    );
+
+    // Endpoint header is ignored if node has no endpoint name configured
+    let header_ignored_when_unconfigured_res = client
+        .post(format!("http://{}/v1/transactions", ta2.agent.api_addr()))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header("x-corrosion-requested-endpoint-name", "eu-west-1")
+        .body(serde_json::to_vec(&req_body_4)?)
+        .send()
+        .await?;
+    assert_eq!(
+        header_ignored_when_unconfigured_res.status(),
+        StatusCode::OK
+    );
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 
 async fn insert_rows_and_gossip() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
@@ -406,45 +487,13 @@ pub async fn configurable_stress_test(
 
     println!("expecting {changes_count} ops");
 
-    // tokio::spawn({
-    //     let bookies = agents
-    //         .iter()
-    //         .map(|a| (a.agent.actor_id(), a.bookie.clone()))
-    //         .collect::<Vec<_>>();
-    //     async move {
-    //         loop {
-    //             tokio::time::sleep(Duration::from_secs(1)).await;
-    //             for (actor_id, bookie) in bookies.iter() {
-    //                 let registry = bookie.registry();
-    //                 let r = registry.map.read();
-
-    //                 for v in r.values() {
-    //                     debug!(%actor_id, "GOT A LOCK {v:?}");
-    //                 }
-    //             }
-    //         }
-    //     }
-    // });
-
     let start = Instant::now();
 
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         debug!("looping");
-        for ta in agents.iter() {
-            let registry = ta.bookie.registry();
-            let r = registry.map.read();
 
-            for v in r.values() {
-                println!(
-                    "{}: GOT A LOCK: {} has been locked for {:?}",
-                    ta.agent.actor_id(),
-                    v.label,
-                    v.started_at.elapsed()
-                );
-            }
-        }
         tokio::time::sleep(Duration::from_secs(1)).await;
         println!("checking status after {}s", start.elapsed().as_secs_f32());
         let mut v = vec![];
@@ -466,13 +515,7 @@ pub async fn configurable_stress_test(
 
             debug!(
                 "last version: {:?}",
-                ta.bookie
-                    .write::<&str, _>("test", None)
-                    .await
-                    .ensure(ta.agent.actor_id())
-                    .read::<&str, _>("test", None)
-                    .await
-                    .last()
+                ta.bookie.ensure(ta.agent.actor_id()).read().last()
             );
 
             let sync = generate_sync(&ta.bookie, ta.agent.actor_id()).await;
@@ -702,14 +745,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
 
         println!(
             "{name}: bookie: {:?}",
-            ta.bookie
-                .read::<&str, _>("test", None)
-                .await
-                .get(&ta1.agent.actor_id())
-                .unwrap()
-                .read::<&str, _>("test", None)
-                .await
-                .deref()
+            ta.bookie.get(&ta1.agent.actor_id()).unwrap().read().deref()
         );
 
         if count as usize != expected_count {
@@ -1087,6 +1123,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     .await?;
 
     // sent 1-25
+    println!("processing cleared versions 21-25");
     let rows = get_rows(
         ta1.agent.clone(),
         vec![
@@ -1123,12 +1160,8 @@ async fn check_bookie_versions(
     cleared: Vec<RangeInclusive<CrsqlDbVersion>>,
 ) -> eyre::Result<()> {
     let conn = ta.agent.pool().read().await?;
-    let booked = ta
-        .bookie
-        .write::<&str, _>("test", None)
-        .await
-        .ensure(actor_id);
-    let bookedv = booked.read::<&str, _>("test", None).await;
+    let booked = ta.bookie.ensure(actor_id);
+    let bookedv = booked.read();
 
     for versions in complete {
         for version in CrsqlDbVersionRange::from(versions.clone()) {
@@ -1172,7 +1205,8 @@ async fn check_bookie_versions(
         }
         assert!(conn.prepare_cached(
             "SELECT EXISTS (SELECT 1 FROM __corro_bookkeeping_gaps WHERE actor_id = ? and start = ? and end = ?)")?
-            .query_row((actor_id, versions.start(), versions.end()), |row| row.get(0))?);
+            .query_row((actor_id, versions.start(), versions.end()), |row| row.get(0))?,
+        "missing gap {versions:?} in __corro_bookkeeping_gaps table");
     }
 
     for versions in cleared {

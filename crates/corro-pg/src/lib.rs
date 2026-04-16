@@ -4,6 +4,7 @@ mod ssl;
 pub mod utils;
 mod vtab;
 
+use codec::VecFromSqlText;
 use eyre::WrapErr;
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
@@ -11,15 +12,17 @@ use std::{
     net::SocketAddr,
     rc::Rc,
     str::{FromStr, Utf8Error},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicI32, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
 use chrono::NaiveDateTime;
-use codec::PgWireMessageServerCodec;
 use compact_str::CompactString;
 use corro_types::{
-    agent::{Agent, ChangeError},
+    agent::{Agent, BookieWriteGuard, ChangeError},
     broadcast::{broadcast_changes, Timestamp},
     change::{insert_local_changes, InsertChangesInfo},
     config::PgConfig,
@@ -32,6 +35,7 @@ use futures::{SinkExt, StreamExt};
 use metrics::counter;
 use pgwire::{
     api::results::{DataRowEncoder, FieldFormat, FieldInfo, Tag},
+    api::DefaultClient,
     error::{ErrorInfo, PgWireError},
     messages::{
         data::{NoData, ParameterDescription, RowDescription},
@@ -42,8 +46,11 @@ use pgwire::{
         startup::ParameterStatus,
         PgWireBackendMessage, PgWireFrontendMessage,
     },
+    tokio::server::PgWireMessageServerCodec,
+    types::{format::FormatOptions, FromSqlText},
 };
 use postgres_types::{FromSql, Type};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use rusqlite::{
     ffi::SQLITE_CONSTRAINT_UNIQUE, functions::FunctionFlags, types::ValueRef,
     vtab::eponymous_only_module, Connection, Statement,
@@ -60,7 +67,7 @@ use tokio::{
     net::TcpListener,
     sync::{
         mpsc::{channel, Sender},
-        AcquireError, OwnedSemaphorePermit,
+        AcquireError, OwnedSemaphorePermit, RwLock as TokioRwLock,
     },
     time::timeout,
 };
@@ -345,11 +352,11 @@ fn parse_query(sql: &str) -> Result<VecDeque<ParsedCmd>, ParseError> {
     Ok(cmds)
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 enum TxState {
     Started {
         kind: OpenTxKind,
-        write_permit: Option<OwnedSemaphorePermit>,
+        permits: Option<(OwnedSemaphorePermit, BookieWriteGuard)>,
     },
     #[default]
     Ended,
@@ -359,13 +366,13 @@ impl TxState {
     fn implicit() -> Self {
         Self::Started {
             kind: OpenTxKind::Implicit,
-            write_permit: None,
+            permits: None,
         }
     }
     fn explicit() -> Self {
         Self::Started {
             kind: OpenTxKind::Explicit,
-            write_permit: None,
+            permits: None,
         }
     }
 
@@ -373,15 +380,17 @@ impl TxState {
         matches!(
             self,
             TxState::Started {
-                write_permit: Some(_),
+                permits: Some(_),
                 ..
             }
         )
     }
 
-    fn set_write_permit(&mut self, permit: OwnedSemaphorePermit) {
+    fn set_write_context(&mut self, permit: OwnedSemaphorePermit, bookie_write: BookieWriteGuard) {
         match self {
-            TxState::Started { write_permit, .. } => *write_permit = Some(permit),
+            TxState::Started { permits, .. } => {
+                *permits = Some((permit, bookie_write));
+            }
             TxState::Ended => {
                 // do nothing, maybe bomb?
             }
@@ -418,13 +427,13 @@ impl TxState {
         *self = Self::explicit()
     }
 
-    fn end(&mut self) -> Option<OwnedSemaphorePermit> {
-        let permit = match self {
-            TxState::Started { write_permit, .. } => write_permit.take(),
+    fn end(&mut self) -> Option<(OwnedSemaphorePermit, BookieWriteGuard)> {
+        let permits = match self {
+            TxState::Started { permits, .. } => permits.take(),
             TxState::Ended => None,
         };
         *self = TxState::Ended;
-        permit
+        permits
     }
 }
 
@@ -432,6 +441,37 @@ impl TxState {
 enum OpenTxKind {
     Implicit,
     Explicit,
+}
+
+#[derive(Debug, Clone)]
+struct CancelInfo {
+    cancel: CancellationToken,
+    secret_key: i32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PgTaskCancellation(Arc<TokioRwLock<HashMap<i32, CancelInfo>>>);
+
+impl PgTaskCancellation {
+    pub async fn insert(&self, conn_id: i32, cancel: CancellationToken, secret_key: i32) {
+        self.0
+            .write()
+            .await
+            .insert(conn_id, CancelInfo { cancel, secret_key });
+    }
+
+    pub async fn remove(&self, conn_id: i32) {
+        self.0.write().await.remove(&conn_id);
+    }
+
+    pub async fn get_and_verify(&self, conn_id: i32, secret_key: i32) -> Option<CancellationToken> {
+        if let Some(cancel_info) = self.0.read().await.get(&conn_id).cloned() {
+            if cancel_info.secret_key == secret_key {
+                return Some(cancel_info.cancel);
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -519,6 +559,8 @@ pub async fn start(
     "protocol" => "pg",
     "readonly" => readonly.to_string(),
     );
+    let conn_counter = AtomicI32::new(0);
+    let task_cancellation = PgTaskCancellation::default();
 
     spawn_counted(async move {
         let mut conn_tripwire = tripwire.clone();
@@ -538,6 +580,8 @@ pub async fn start(
             let tripwire = tripwire.clone();
             // Don't use spawn_counted here
             // Until the connection gets fully established we don't need to gracefully close it
+            let conn_id = conn_counter.fetch_add(1, Ordering::SeqCst);
+            let task_cancellation = task_cancellation.clone();
             tokio::spawn(async move {
                 conn.stream.set_nodelay(true)?;
                 {
@@ -551,53 +595,79 @@ pub async fn start(
 
                 let mut tcp_socket = Framed::new(
                     tokio::io::BufStream::new(conn),
-                    PgWireMessageServerCodec::new(codec::Client::new(local_addr, false)),
+                    PgWireMessageServerCodec::<()>::new(DefaultClient::new(local_addr, false)),
                 );
 
                 let negotiation =
                     ssl::negotiate_ssl(&mut tcp_socket, tls_acceptor.is_some()).await?;
 
-                let (mut framed, secured) = if matches!(negotiation, ssl::SslNegotiationType::None)
-                {
-                    if ssl_required {
-                        debug!("rejecting non-ssl connection");
+                let (mut framed, secured, maybe_next_msg) =
+                    if matches!(negotiation, ssl::SslNegotiationType::None(_)) {
+                        if ssl_required {
+                            debug!("rejecting non-ssl connection");
+                            return Ok(());
+                        }
+
+                        let maybe_next_msg = match negotiation {
+                            ssl::SslNegotiationType::None(Some(msg)) => Some(msg),
+                            _ => None,
+                        };
+
+                        (Either::Left(tcp_socket), false, maybe_next_msg)
+                    } else if let Some(tls) = tls_acceptor {
+                        let tls_socket = tls.accept(tcp_socket.into_inner()).await?;
+
+                        if matches!(negotiation, ssl::SslNegotiationType::Direct) {
+                            ssl::check_alpn_for_direct_ssl(&tls_socket)?;
+                        }
+
+                        let framed = Framed::new(
+                            tokio::io::BufStream::new(tls_socket),
+                            PgWireMessageServerCodec::new(DefaultClient::<()>::new(
+                                local_addr, true,
+                            )),
+                        );
+
+                        (Either::Right(framed), true, None)
+                    } else {
+                        trace!("received SSL connection attempt without a TLS acceptor configured");
                         return Ok(());
-                    }
-
-                    (Either::Left(tcp_socket), false)
-                } else if let Some(tls) = tls_acceptor {
-                    let tls_socket = tls.accept(tcp_socket.into_inner()).await?;
-
-                    if matches!(negotiation, ssl::SslNegotiationType::Direct) {
-                        ssl::check_alpn_for_direct_ssl(&tls_socket)?;
-                    }
-
-                    let framed = Framed::new(
-                        tokio::io::BufStream::new(tls_socket),
-                        PgWireMessageServerCodec::new(codec::Client::new(local_addr, true)),
-                    );
-
-                    (Either::Right(framed), true)
-                } else {
-                    trace!("received SSL connection attempt without a TLS acceptor configured");
-                    return Ok(());
-                };
+                    };
 
                 trace!("SSL ? {secured}");
 
                 use crate::codec::SetState;
-                framed.set_state(pgwire::api::PgWireConnectionState::AwaitingStartup);
 
-                let msg = match framed.next().await {
-                    Some(msg) => msg?,
+                trace!("maybe_next_msg: {maybe_next_msg:?}");
+                let msg = match maybe_next_msg {
+                    Some(msg) => msg,
                     None => {
-                        return Ok(());
+                        framed.set_state(pgwire::api::PgWireConnectionState::AwaitingStartup);
+                        match framed.next().await {
+                            Some(msg) => msg?,
+                            None => return Ok(()),
+                        }
                     }
                 };
 
                 match msg {
                     PgWireFrontendMessage::Startup(startup) => {
                         debug!("received startup message: {startup:?}");
+                    }
+                    PgWireFrontendMessage::CancelRequest(cancel_request) => {
+                        debug!("received cancel request: {cancel_request:?}");
+
+                        if let Some(secret_key) = cancel_request.secret_key.as_i32() {
+                            if let Some(cancel) = task_cancellation
+                                .get_and_verify(cancel_request.pid, secret_key)
+                                .await
+                            {
+                                cancel.cancel();
+                            } else {
+                                warn!("invalid secret key for cancel request");
+                            }
+                        }
+                        return Ok(());
                     }
                     _ => {
                         framed
@@ -629,6 +699,23 @@ pub async fn start(
                     )))
                     .await?;
 
+                let mut rng = StdRng::from_os_rng();
+                let secret_key: i32 = rng.random::<i32>();
+
+                let cancel = CancellationToken::new();
+                task_cancellation
+                    .insert(conn_id, cancel.clone(), secret_key)
+                    .await;
+
+                framed
+                    .feed(PgWireBackendMessage::BackendKeyData(
+                        pgwire::messages::startup::BackendKeyData::new(
+                            conn_id,
+                            pgwire::messages::startup::SecretKey::I32(secret_key),
+                        ),
+                    ))
+                    .await?;
+
                 framed
                     .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
                         TransactionStatus::Idle,
@@ -643,8 +730,6 @@ pub async fn start(
                 let (back_tx, mut back_rx) = channel(1024);
 
                 let (mut sink, mut stream) = framed.split();
-
-                let cancel = CancellationToken::new();
 
                 // If we're shutting down corrosion, both frontend and backend tasks will finish
                 let mut frontend_task = spawn_counted({
@@ -988,16 +1073,10 @@ pub async fn start(
                                             if param_types.len() != prepped.parameter_count() {
                                                 let extracted_types = parameter_types(&schema, &parsed_cmd);
 
-                                                if extracted_types.is_err() {
-                                                        let e = extracted_types.unwrap_err();
-                                                        back_tx.blocking_send(BackendResponse::Message {
-                                                            message: e.into(),
-                                                            flush: true,
-                                                        })?;
-                                                        discard_until_sync = true;
-                                                        continue;
-                                                    }
-                                                param_types = extracted_types.unwrap().params
+
+                                                param_types = match extracted_types {
+                                                    Ok(extracted_types) => {
+                                                        extracted_types.params
                                                     .into_iter()
                                                     .map(|param| {
                                                         trace!("got param: {param:?}");
@@ -1035,7 +1114,17 @@ pub async fn start(
                                                             },
                                                         }
                                                     })
-                                                    .collect();
+                                                    .collect()
+                                                    }
+                                                    Err(e) => {
+                                                        back_tx.blocking_send(BackendResponse::Message {
+                                                            message: e.into(),
+                                                            flush: true,
+                                                        })?;
+                                                        discard_until_sync = true;
+                                                        continue;
+                                                    }
+                                                };
                                             }
 
                                             let fields = match field_types(
@@ -1779,9 +1868,15 @@ pub async fn start(
                                     // automatically commit an implicit tx
                                     if session.tx_state.is_implicit() {
                                         trace!("committing IMPLICIT tx");
-                                        let _permit = session.tx_state.end();
+                                        let permits = session.tx_state.end();
 
-                                        if let Err(e) = session.handle_commit() {
+                                        let commit_res = if let Some((_permit, bookie_write)) = permits {
+                                            session.handle_commit(bookie_write)
+                                        } else {
+                                            session.commit_db()
+                                        };
+
+                                        if let Err(e) = commit_res {
                                             back_tx.blocking_send(
                                                 (
                                                     PgWireBackendMessage::ErrorResponse(
@@ -1939,14 +2034,14 @@ pub async fn start(
                                     continue;
                                 }
                                 PgWireFrontendMessage::CancelRequest(_) => {
-                                    // cancel.cancel(); ?
+                                    // cancel should be sent as first message on a new connection.
                                     back_tx.blocking_send(
                                         (
                                             PgWireBackendMessage::ErrorResponse(
                                                 ErrorInfo::new(
                                                     "ERROR".into(),
                                                     "XX000".to_owned(),
-                                                    "Cancel is not implemented".into(),
+                                                    "Unexpected Cancel message".into(),
                                                 )
                                                 .into(),
                                             ),
@@ -1955,22 +2050,16 @@ pub async fn start(
                                             .into(),
                                     )?;
                                     continue;
-                                }
-                                PgWireFrontendMessage::GssEncRequest(_) => {
-                                    back_tx.blocking_send(
-                                        (
-                                            PgWireBackendMessage::GssEncResponse(pgwire::messages::response::GssEncResponse::Refuse), false
-                                        ).into())?;
-                                    continue;
-                                }
-                                PgWireFrontendMessage::SslRequest(_) => {
+                                },
+                                PgWireFrontendMessage::SslNegotiation(_) => {
+                                    // SSL Negotiation should be sent as first message on a new connection.
                                     back_tx.blocking_send(
                                         (
                                             PgWireBackendMessage::ErrorResponse(
                                                 ErrorInfo::new(
                                                     "ERROR".into(),
                                                     "XX000".to_owned(),
-                                                    "SslRequest is not implemented".into(),
+                                                    "Unexpected SSL Negotiation message".into(),
                                                 )
                                                 .into(),
                                             ),
@@ -1979,7 +2068,11 @@ pub async fn start(
                                             .into(),
                                     )?;
                                     continue;
-                                }
+
+                                },
+                                PgWireFrontendMessage::PortalSuspended(_) => {
+                                    // this shouldn't happen, backend sends this msg.
+                                },
                             }
                         }
 
@@ -2032,11 +2125,13 @@ pub async fn start(
                 // The message-handling loop has completed, make sure we also abort the tasks
                 // handling the TCP connection
                 // Firstly we attempt a graceful shutdown -- dropping back_tx will cause
+
                 // backend_task to complete once it writes all content to the TCP socket
                 // Then, frontend_task will eventually receive an EOF if clients behave properly
                 // Note that this should be the only reference of back_tx at this point:
                 // the one in frontend_task is weak, and the one cloned into the message-handling
                 // thread should have been dropped.
+                task_cancellation.remove(conn_id).await;
                 assert_eq!(back_tx.strong_count(), 1);
                 drop(back_tx);
 
@@ -2112,9 +2207,13 @@ impl<'conn> Session<'conn> {
             self.tx_state.start_implicit();
         } else if self.tx_state.is_implicit() && cmd.is_begin() {
             trace!("committing IMPLICIT tx");
-            let _permit = self.tx_state.end();
+            let permits = self.tx_state.end();
 
-            self.handle_commit()?;
+            if let Some((_permit, bookie_write)) = permits {
+                self.handle_commit(bookie_write)?;
+            } else {
+                self.commit_db()?;
+            }
             trace!("committed IMPLICIT tx");
         }
 
@@ -2127,11 +2226,15 @@ impl<'conn> Session<'conn> {
             self.tx_state.start_explicit();
             0
         } else if cmd.is_commit() {
-            let _permit = self.tx_state.end();
-            self.handle_commit()?;
+            let permits = self.tx_state.end();
+            if let Some((_permit, bookie_write)) = permits {
+                self.handle_commit(bookie_write)?;
+            } else {
+                self.commit_db()?;
+            }
             0
         } else if cmd.is_rollback() {
-            let _permit = self.tx_state.end();
+            let _permits = self.tx_state.end();
             self.conn.execute_batch("ROLLBACK")?;
             0
         } else {
@@ -2161,8 +2264,9 @@ impl<'conn> Session<'conn> {
 
             if !self.tx_state.is_writing() && !prepped.readonly() {
                 trace!("query statement writes, acquiring permit...");
-                self.tx_state
-                    .set_write_permit(self.agent.write_permit_blocking()?);
+                let write_permit = self.agent.write_permit_blocking()?;
+                let bookie_permit = self.agent.bookie().write_lock_blocking();
+                self.tx_state.set_write_context(write_permit, bookie_permit);
 
                 counter!("corro.acquired.write.permit.count", "protocol" => "pg").increment(1);
                 self.set_ts()?;
@@ -2195,7 +2299,7 @@ impl<'conn> Session<'conn> {
                         }
                     }
                 }
-                let data_row = encoder.finish()?;
+                let data_row = encoder.take_row();
                 back_tx
                     .blocking_send((PgWireBackendMessage::DataRow(data_row), false).into())
                     .map_err(|_| QueryError::BackendResponseSendFailed)?;
@@ -2271,16 +2375,21 @@ impl<'conn> Session<'conn> {
         let mut changes = 0usize;
 
         if cmd.is_commit() {
-            let _permit = self.tx_state.end();
-            self.handle_commit()?;
+            let permits = self.tx_state.end();
+            if let Some((_permit, bookie_write)) = permits {
+                self.handle_commit(bookie_write)?;
+            } else {
+                self.commit_db()?;
+            }
         } else if cmd.is_begin() {
             // do nothing
             debug!("cmd is BEGIN");
         } else {
             if !self.tx_state.is_writing() && !prepped.readonly() {
                 trace!("statement writes, acquiring permit...");
-                self.tx_state
-                    .set_write_permit(self.agent.write_permit_blocking()?);
+                let write_permit = self.agent.write_permit_blocking()?;
+                let bookie_permit = self.agent.bookie().write_lock_blocking();
+                self.tx_state.set_write_context(write_permit, bookie_permit);
 
                 self.set_ts()?;
             }
@@ -2319,6 +2428,7 @@ impl<'conn> Session<'conn> {
                 for (idx, field) in schema.iter().enumerate() {
                     trace!("processing field: {field:?}");
                     let format = field.format();
+                    let format_opts = field.format_options().as_ref();
                     match field.datatype() {
                         &Type::ANY => {
                             let data = row.get_ref_unwrap(idx);
@@ -2328,11 +2438,17 @@ impl<'conn> Session<'conn> {
                                         &None::<i8>,
                                         &Type::ANY,
                                         format,
+                                        format_opts,
                                     )
                                     .unwrap(),
                                 ValueRef::Integer(i) => {
                                     encoder
-                                        .encode_field_with_type_and_format(&i, &Type::INT8, format)
+                                        .encode_field_with_type_and_format(
+                                            &i,
+                                            &Type::INT8,
+                                            format,
+                                            format_opts,
+                                        )
                                         .unwrap();
                                 }
                                 ValueRef::Real(f) => {
@@ -2341,6 +2457,7 @@ impl<'conn> Session<'conn> {
                                             &f,
                                             &Type::FLOAT8,
                                             format,
+                                            format_opts,
                                         )
                                         .unwrap();
                                 }
@@ -2350,12 +2467,18 @@ impl<'conn> Session<'conn> {
                                             &String::from_utf8_lossy(t).as_ref(),
                                             &Type::TEXT,
                                             format,
+                                            format_opts,
                                         )
                                         .unwrap();
                                 }
                                 ValueRef::Blob(b) => {
                                     encoder
-                                        .encode_field_with_type_and_format(&b, &Type::BYTEA, format)
+                                        .encode_field_with_type_and_format(
+                                            &b,
+                                            &Type::BYTEA,
+                                            format,
+                                            format_opts,
+                                        )
                                         .unwrap();
                                 }
                             }
@@ -2366,6 +2489,7 @@ impl<'conn> Session<'conn> {
                                     &row.get::<_, Option<i64>>(idx)?,
                                     t,
                                     format,
+                                    format_opts,
                                 )
                                 .unwrap();
                         }
@@ -2375,6 +2499,7 @@ impl<'conn> Session<'conn> {
                                     &row.get::<_, Option<NaiveDateTime>>(idx)?,
                                     t,
                                     format,
+                                    format_opts,
                                 )
                                 .unwrap();
                         }
@@ -2384,6 +2509,7 @@ impl<'conn> Session<'conn> {
                                     &row.get::<_, Option<String>>(idx)?,
                                     t,
                                     format,
+                                    format_opts,
                                 )
                                 .unwrap();
                         }
@@ -2393,6 +2519,7 @@ impl<'conn> Session<'conn> {
                                     &row.get::<_, Option<Vec<u8>>>(idx)?,
                                     t,
                                     format,
+                                    format_opts,
                                 )
                                 .unwrap();
                         }
@@ -2402,6 +2529,7 @@ impl<'conn> Session<'conn> {
                                     &row.get::<_, Option<f64>>(idx)?,
                                     t,
                                     format,
+                                    format_opts,
                                 )
                                 .unwrap();
                         }
@@ -2413,7 +2541,7 @@ impl<'conn> Session<'conn> {
                     }
                 }
 
-                let data_row = encoder.finish()?;
+                let data_row = encoder.take_row();
                 back_tx
                     .blocking_send((PgWireBackendMessage::DataRow(data_row), false).into())
                     .map_err(|_| QueryError::BackendResponseSendFailed)?;
@@ -2424,8 +2552,12 @@ impl<'conn> Session<'conn> {
             }
 
             if opened_implicit_tx {
-                let _permit = self.tx_state.end();
-                self.handle_commit()?;
+                let permits = self.tx_state.end();
+                if let Some((_permit, bookie_write)) = permits {
+                    self.handle_commit(bookie_write)?;
+                } else {
+                    self.commit_db()?;
+                }
             }
         }
 
@@ -2447,15 +2579,24 @@ impl<'conn> Session<'conn> {
         Ok(())
     }
 
-    fn handle_commit(&self) -> Result<(), ChangeError> {
+    fn commit_db(&self) -> Result<(), ChangeError> {
+        let actor_id = self.agent.actor_id();
+        self.conn
+            .execute_batch("COMMIT")
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
+        Ok(())
+    }
+
+    fn handle_commit(&self, bookie_write: BookieWriteGuard) -> Result<(), ChangeError> {
         trace!("HANDLE COMMIT");
 
-        let mut book_writer = self
-            .agent
-            .booked()
-            .blocking_write::<&str, _>("handle_write_tx(book_writer)", None);
-
         let actor_id = self.agent.actor_id();
+
+        let mut book_writer = bookie_write.write_tx(self.agent.booked());
 
         let insert_info = insert_local_changes(&self.agent, self.conn, &mut book_writer)?;
         self.conn
@@ -2470,12 +2611,11 @@ impl<'conn> Session<'conn> {
             db_version,
             last_seq,
             ts,
-            snap,
         }) = insert_info
         {
             trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
-            book_writer.commit_snapshot(snap);
+            book_writer.commit();
 
             let agent = self.agent.clone();
 
@@ -2500,7 +2640,7 @@ impl<'conn> Session<'conn> {
 impl<'conn> Drop for Session<'conn> {
     fn drop(&mut self) {
         if !self.tx_state.is_ended() {
-            let _permit = self.tx_state.end();
+            let _permits = self.tx_state.end();
             if let Err(e) = self.conn.execute_batch("ROLLBACK") {
                 warn!("failed to rollback tx: {e}");
             } else {
@@ -2516,7 +2656,7 @@ fn send_ready(
     back_tx: &Sender<BackendResponse>,
 ) -> Result<(), BoxError> {
     let ready_status = if session.tx_state.is_implicit() {
-        let _permit = session.tx_state.end(); // do this first, in case of failure
+        let permits = session.tx_state.end(); // do this first, in case of failure
         if discard_until_sync {
             // an error occured, rollback implicit tx!
             warn!("receive Sync message w/ an error to send, rolling back implicit tx");
@@ -2524,7 +2664,11 @@ fn send_ready(
         } else {
             // no error, commit implicit tx
             warn!("receive Sync message, committing implicit tx");
-            session.handle_commit()?;
+            if let Some((_permit, bookie_write)) = permits {
+                session.handle_commit(bookie_write)?;
+            } else {
+                session.commit_db()?;
+            }
         }
 
         TransactionStatus::Idle
@@ -2647,13 +2791,19 @@ fn from_type_and_format<'a, E, T: FromSql<'a> + FromStr<Err = E>>(
     })
 }
 
-fn from_array_type_and_format<'a, T: FromSql<'a>>(
+fn from_array_type_and_format<'a, T>(
     t: &Type,
     b: &'a [u8],
     format_code: FormatCode,
-) -> Result<Vec<T>, ToParamError<String>> {
+) -> Result<Vec<T>, ToParamError<String>>
+where
+    T: FromSql<'a> + for<'b> FromSqlText<'b>,
+{
+    let format_opts = FormatOptions::default();
     Ok(match format_code {
-        FormatCode::Text => panic!("Impossible - arrays are only sent in binary format"),
+        FormatCode::Text => {
+            Vec::<T>::from_vec_sql_text(t, b, &format_opts).map_err(ToParamError::FromSql)?
+        }
         FormatCode::Binary => Vec::<T>::from_sql(t, b).map_err(ToParamError::FromSql)?,
     })
 }
@@ -2675,7 +2825,7 @@ impl From<UnsupportedSqliteToPostgresType> for ErrorResponse {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("Untyped array argument for unnest(), please use CAST($N AS T) where T is one of: TEXT[] BLOB[] INT[] INTEGER[] BIGINT[] REAL[] FLOAT[] DOUBLE[]")]
+#[error("Untyped array argument for unnest() (or corro_unnest()), please use CAST($N AS T) where T is one of: TEXT[] BLOB[] INT[] INTEGER[] BIGINT[] REAL[] FLOAT[] DOUBLE[]")]
 struct UntypedUnnestParameter;
 
 impl From<UntypedUnnestParameter> for PgWireBackendMessage {
@@ -2902,10 +3052,16 @@ fn extract_params<'schema, 'stmt>(
         Expr::FunctionCall {
             name: _,
             distinctness: _,
-            args: _,
+            args,
             filter_over: _,
             order_by: _,
-        } => {}
+        } => {
+            if let Some(args) = args {
+                for expr in args.iter() {
+                    extract_params(schema, expr, tables, params)?
+                }
+            }
+        }
 
         Expr::FunctionCallStar {
             name: _,
@@ -3105,7 +3261,8 @@ fn handle_table_call_params<'schema, 'stmt>(
     params: &mut ParamsList<'stmt, 'schema>,
 ) -> Result<(), UntypedUnnestParameter> {
     if let Some(exprs) = args {
-        let is_unnest = qname.name.0.eq_ignore_ascii_case("UNNEST");
+        let is_unnest = qname.name.0.eq_ignore_ascii_case("CORRO_UNNEST")
+            || qname.name.0.eq_ignore_ascii_case("UNNEST");
 
         for expr in exprs.iter() {
             // If not unnest, just extract params
@@ -3352,7 +3509,11 @@ fn parameter_types<'schema, 'stmt>(
 
                 let mut tables = HashMap::new();
                 if let Some(tbl) = schema.tables.get(&tbl_name.name.0) {
-                    tables.insert(tbl_name.name.0.clone(), tbl);
+                    if let Some(alias) = &tbl_name.alias {
+                        tables.insert(alias.0.clone(), tbl);
+                    } else {
+                        tables.insert(tbl_name.name.0.clone(), tbl);
+                    }
                 }
                 if let Some(where_clause) = where_clause {
                     extract_params(schema, where_clause, &tables, &mut params)?;

@@ -6,20 +6,22 @@ use crate::api::public::execute_schema;
 use crate::{
     agent::{
         handlers::{self, spawn_handle_db_maintenance},
-        metrics, setup, util, AgentOptions,
+        metrics,
+        reaper::spawn_reaper,
+        setup, util, AgentOptions,
     },
     broadcast::runtime_loop,
     transport::Transport,
 };
+
 use corro_types::{
-    actor::ActorId,
-    agent::{Agent, BookedVersions, Bookie},
+    agent::{Agent, Bookie},
     base::CrsqlSeq,
     channel::bounded,
     config::{Config, PerfConfig},
 };
 
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::FutureExt;
 use spawn::spawn_counted;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
@@ -51,7 +53,6 @@ async fn run(
         transport,
         api_listeners,
         mut tripwire,
-        lock_registry,
         rx_bcast,
         rx_apply,
         rx_clear_buf,
@@ -139,6 +140,9 @@ async fn run(
         transport.clone(),
         tripwire.clone(),
     ));
+
+    spawn_counted(corro_types::sqlite::query_metrics_loop(tripwire.clone()));
+
     spawn_counted(handlers::handle_gossip_to_send(
         transport.clone(),
         to_send_rx,
@@ -152,57 +156,17 @@ async fn run(
 
     spawn_handle_db_maintenance(&agent);
 
-    let bookie = Bookie::new_with_registry(Default::default(), lock_registry);
-    {
-        let mut w = bookie.write::<&str, _>("init", None).await;
-        w.insert(agent.actor_id(), agent.booked().clone());
-    }
+    let bookie = agent.bookie().clone();
 
+    // Bookie was fully loaded by setup(). Walk it to schedule apply for any
+    // fully-buffered (gap-free) partials that were never applied before shutdown.
     let start = Instant::now();
     {
-        let conn = agent.pool().read().await?;
-        // check __corro_seq_bookkeeping for any actor ids that we only have partial changes for.
-        let actor_ids: Vec<ActorId> = conn
-            .prepare(
-                "SELECT site_id FROM crsql_site_id WHERE ordinal > 0
-                        UNION
-                    SELECT distinct site_id FROM __corro_seq_bookkeeping",
-            )?
-            .query_map([], |row| row.get(0))
-            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
-
-        // not strictly required, but we don't need to keep it open
-        drop(conn);
-
-        let pool = agent.pool();
-
-        let mut buf = futures::stream::iter(
-            actor_ids
-                .into_iter()
-                // don't re-process the current actor!
-                .filter(|other_actor_id| *other_actor_id != agent.actor_id())
-                .map(|actor_id| {
-                    let pool = pool.clone();
-                    async move {
-                        tokio::spawn(async move {
-                            let conn = pool.read().await?;
-
-                            tokio::task::block_in_place(|| {
-                                BookedVersions::from_conn(&conn, actor_id)
-                                    .map(|bv| (actor_id, bv))
-                                    .map_err(eyre::Report::from)
-                            })
-                        })
-                        .await?
-                    }
-                }),
-        )
-        .buffer_unordered(4);
-
-        while let Some((actor_id, bv)) = TryStreamExt::try_next(&mut buf).await? {
-            for (version, partial) in bv.partials.iter() {
+        let guard = bookie.owned_guard();
+        for (&actor_id, booked) in bookie.iter(&guard) {
+            let bookedr = booked.read();
+            for (version, partial) in bookedr.partials.iter() {
                 let gaps_count = partial.seqs.gaps(&(CrsqlSeq(0)..=partial.last_seq)).count();
-
                 if gaps_count == 0 {
                     info!(%actor_id, %version, "found fully buffered, unapplied, changes! scheduling apply");
                     let tx_apply = agent.tx_apply().clone();
@@ -214,15 +178,9 @@ async fn run(
                     });
                 }
             }
-
-            bookie
-                .write::<&str, _>("replace_actor", None)
-                .await
-                .replace_actor(actor_id, bv);
         }
     }
-
-    info!("Bookkeeping fully loaded in {:?}", start.elapsed());
+    info!("Checked bookie partials in {:?}", start.elapsed());
 
     spawn_counted(
         util::sync_loop(
@@ -243,6 +201,10 @@ async fn run(
         )
         .inspect(|_| info!("corrosion buffered changes loop is done")),
     );
+
+    if let Err(e) = spawn_reaper(&agent, tripwire.clone()) {
+        error!("could not spawn reaper: {e}");
+    }
 
     info!("Starting peer API on udp/{gossip_addr} (QUIC)");
 

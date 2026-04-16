@@ -1,6 +1,6 @@
 #!/usr/bin/env -S python3 -u
+from antithesis.random import AntithesisRandom
 import argparse
-import random
 import time
 import threading
 
@@ -9,17 +9,17 @@ sys.path.append("/opt/antithesis/py-resources")
 import helper
 
 
-random = random.SystemRandom()
+random = AntithesisRandom()
 
 def insert_user(address, team_id):
-    name = helper.random_name()
-    status = random.choice(["active", "inactive", "blocked", "suspended", "admin"])
-    sql_command = f"INSERT INTO users (name, email, team_id, status, created_at) VALUES ('{name}', '{name}@email.com', {team_id}, '{status}', {time.time()}) ON CONFLICT DO NOTHING"
-    success, err = helper.execute_sql(address, sql_command)
-    if not success:
-        print(f"Error inserting user: {err}")
-    # else:
-    #     print(f"Inserted user {name} for team {team_id}")
+    try:
+        name = helper.random_name()
+        status = random.choice(["active", "inactive", "blocked", "suspended", "admin"])
+        sql_command = f"INSERT INTO users (name, email, team_id, status, created_at) VALUES ('{name}', '{name}@email.com', {team_id}, '{status}', {time.time()}) ON CONFLICT DO NOTHING"
+        helper.execute_sql(address, sql_command)
+    except Exception as e:
+        print(f"Error inserting user for {address}: {e}")
+
 
 def do_inserts(address):
     try:
@@ -34,7 +34,7 @@ def do_inserts(address):
 
 def main():
     parser = argparse.ArgumentParser(description='Insert teams and users into corrosion databases')
-    parser.add_argument('--addrs', nargs='+', help='List of corrosion addresses (e.g., --addresses corrosion1:8080 corrosion2:8080)')
+    parser.add_argument('--addrs', nargs='+', help='List of corrosion addresses (e.g., --addrs corrosion1:8080 corrosion2:8080)')
     args = parser.parse_args()
     if args.addrs is None:
         args.addrs = ["corrosion1:8080", "corrosion2:8080", "corrosion3:8080"]

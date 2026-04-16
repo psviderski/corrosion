@@ -147,7 +147,7 @@ pub fn runtime_loop(
         bounded(agent.config().perf.schedule_channel_len, "to_schedule");
 
     let mut runtime: DispatchRuntime<Actor> =
-        DispatchRuntime::new(to_send_tx, to_schedule_tx, notifications_tx);
+        DispatchRuntime::new(to_send_tx, to_schedule_tx, notifications_tx.clone());
 
     let (timer_tx, mut timer_rx) = mpsc::channel(10);
     let timer_spawner = TimerSpawner::new(timer_tx);
@@ -322,7 +322,7 @@ pub fn runtime_loop(
                         gauge!("corro.gossip.cluster_size").set(last_cluster_size.get() as f64);
                     }
                     Branch::DiffMembers => {
-                        diff_member_states(&agent, &foca, &mut last_states);
+                        diff_member_states(&agent, &foca, &mut last_states, &notifications_tx);
                     }
                 }
 
@@ -375,7 +375,9 @@ pub fn runtime_loop(
                 }
             }
 
-            if let Some(handle) = diff_member_states(&agent, &foca, &mut last_states) {
+            if let Some(handle) =
+                diff_member_states(&agent, &foca, &mut last_states, &notifications_tx)
+            {
                 info!("Waiting on task to update member states...");
                 if let Err(e) = handle.await {
                     error!("could not await task to update member states: {e}");
@@ -723,8 +725,6 @@ async fn handle_broadcasts(
                         )
                 };
 
-                let pending_sent_instance = pending.sent_to.len();
-
                 let mut spawn_count = 0;
                 trace!("broadcasting to: {:?}", broadcast_to);
                 for addr in broadcast_to {
@@ -764,26 +764,22 @@ async fn handle_broadcasts(
 
                 counter!("corro.broadcast.spawn", "type" => "global").increment(spawn_count);
 
-                if pending_sent_instance != pending.sent_to.len() {
-                    // we've sent this to at least 1 member...
+                if let Some(send_count) = pending.send_count.checked_add(1) {
+                    trace!("send_count: {send_count}, max_transmissions: {max_transmissions}");
+                    pending.send_count = send_count;
 
-                    if let Some(send_count) = pending.send_count.checked_add(1) {
-                        trace!("send_count: {send_count}, max_transmissions: {max_transmissions}");
-                        pending.send_count = send_count;
-
-                        if send_count < max_transmissions {
-                            debug!("queueing for re-send");
-                            idle_pendings.push(Box::pin(async move {
-                                // slow our send pace if we've been previously rate limited
-                                let sleep_ms_base = if prev_rate_limited { 500 } else { 100 };
-                                // send with increasing latency as we've already sent the updates out
-                                tokio::time::sleep(Duration::from_millis(
-                                    sleep_ms_base * send_count as u64,
-                                ))
-                                .await;
-                                pending
-                            }));
-                        }
+                    if send_count < max_transmissions {
+                        debug!("queueing for re-send");
+                        idle_pendings.push(Box::pin(async move {
+                            // slow our send pace if we've been previously rate limited
+                            let sleep_ms_base = if prev_rate_limited { 500 } else { 100 };
+                            // send with increasing latency as we've already sent the updates out
+                            tokio::time::sleep(Duration::from_millis(
+                                sleep_ms_base * send_count as u64,
+                            ))
+                            .await;
+                            pending
+                        }));
                     }
                 }
             }
@@ -826,6 +822,7 @@ fn diff_member_states(
     agent: &Agent,
     foca: &Foca<Actor, BincodeCodec<bincode::config::Configuration>, StdRng, NoCustomBroadcast>,
     last_states: &mut HashMap<ActorId, (foca::Member<Actor>, Option<u64>)>,
+    notifications_tx: &CorroSender<foca::OwnedNotification<Actor>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let mut foca_states = HashMap::new();
     for member in foca.iter_membership_state() {
@@ -891,10 +888,51 @@ fn diff_member_states(
         }
     });
 
+    let mut foca_notifications = vec![];
+    foca_notifications.extend(foca_states.iter().filter_map(|(id, member)| {
+        let member = *member;
+        if foca_state_is_active(&member.state()) && members.get(id).is_none() {
+            Some(foca::OwnedNotification::MemberUp(member.id().clone()))
+        } else {
+            None
+        }
+    }));
+
+    foca_notifications.extend(members.states.iter().filter_map(|(id, member_state)| {
+        match foca_states.get(id) {
+            Some(foca_state) => {
+                if !foca_state_is_active(&foca_state.state()) {
+                    Some(foca::OwnedNotification::MemberDown(foca_state.id().clone()))
+                } else {
+                    None
+                }
+            }
+            None => Some(foca::OwnedNotification::MemberDown(
+                member_state.to_actor(*id),
+            )),
+        }
+    }));
+
+    drop(members);
+
+    if !foca_notifications.is_empty() {
+        info!(
+            "Sending out {} foca notifications for members",
+            foca_notifications.len()
+        );
+        // best effort update since we'd retry this function.
+        for notification in foca_notifications {
+            if let Err(e) = notifications_tx.try_send(notification) {
+                error!("error dispatching notifications from diff_member_states: {e}");
+                counter!("corro.channel.error", "type" => "full", "name" => "dispatch.notifications")
+                    .increment(1);
+            }
+        }
+    }
+
     if to_update.is_empty() && to_delete.is_empty() {
         return None;
     }
-
     info!(
         "Scheduling cluster membership state update for {} members (delete: {})",
         to_update.len(),
@@ -972,6 +1010,10 @@ fn diff_member_states(
 
         info!("Membership states changed! upserted: {upserted}, deleted {deleted}");
     }))
+}
+
+fn foca_state_is_active(state: &foca::State) -> bool {
+    matches!(*state, foca::State::Alive | foca::State::Suspect)
 }
 
 fn make_foca_config(cluster_size: NonZeroU32) -> foca::Config {
@@ -1060,7 +1102,7 @@ fn try_transmit_broadcast(
                 error!("could not write to uni stream to {addr}: {e}");
             }
             Ok(Ok(_)) => {
-                counter!("corro.peer.stream.bytes.sent.total", "type" => "uni")
+                counter!("corro.peer.stream.bytes.sent.total", "traffic" => "broadcast")
                     .increment(len as u64);
             }
         }
