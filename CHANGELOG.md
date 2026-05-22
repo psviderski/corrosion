@@ -1,5 +1,9 @@
 # Changelog
 
+## v2026.5.14
+
+Tracks upstream [v1.0.0](https://github.com/superfly/corrosion/releases/tag/v1.0.0) with changes in the build pipeline.
+
 ## v1.0.0
 
 v1.0.0 is packed with a lot of new features and bug fixes. Some high-level details include:
