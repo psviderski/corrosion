@@ -1,5 +1,9 @@
 # Changelog
 
+## v2026.6.15
+
+- **CLI:** `corrosion query/exec` commands now send the `Authorization: Bearer <token>` header when `api.authz.bearer-token` is configured, so they work against an authz-enabled API endpoint.
+
 ## v2026.5.14
 
 Tracks upstream [v1.0.0](https://github.com/superfly/corrosion/releases/tag/v1.0.0) with changes in the build pipeline.
